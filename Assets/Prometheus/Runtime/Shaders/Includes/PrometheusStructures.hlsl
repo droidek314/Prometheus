@@ -180,6 +180,123 @@ StructuredBuffer<PrometheusInstance> _PrometheusInstances : register(t2);
 // Sorted instance permutation addressed by TLAS leaves. See PrometheusGetLeafInstance.
 StructuredBuffer<uint> _PrometheusInstanceIndices : register(t3);
 
+// Per-instance diffuse albedo, parallel to _PrometheusInstances. Bounce light takes the
+// colour of the surface it left, so indirect lighting is meaningless without it.
+//
+// Held in its own buffer rather than folded into PrometheusInstance because that record is a
+// 64-byte layout contract shared with C# and verified by the memory layout tests; widening it
+// would move every field after the matrix rows for the sake of data only one kernel reads.
+StructuredBuffer<float4> _PrometheusInstanceAlbedo;
+
+// Per-instance surface response: (metallic, smoothness, unused, unused).
+//
+// Separate from the albedo buffer rather than packed into its unused alpha, because two
+// values are needed and because this is the natural place for anything else a surface
+// eventually needs to say about itself.
+StructuredBuffer<float4> _PrometheusInstanceMaterial;
+
+// Per-instance emitted radiance, in rgb. Zero for everything that does not glow.
+//
+// This is what turns a neon sign from a bright-looking surface into an actual light. URP
+// already draws an emissive material bright, but that is only its own pixels; nothing in a
+// rasterised pipeline lets a glowing surface illuminate anything else. A ray that lands on
+// one, on the other hand, has simply found a light, and it costs nothing beyond the hit it
+// was already paying for.
+//
+// The shape is preserved for free, which is the entire point for neon. A long tube lights a
+// wall like a long tube, because the rays land along its length; approximating it with a
+// point light cannot do that at any cost.
+StructuredBuffer<float4> _PrometheusInstanceEmission;
+
+// =====================================================================================
+//  PrometheusLight - 64 bytes (4 x 16)
+//
+//  Mirrors URP's own additional-light constants rather than a tidier layout of our own.
+//  The host fills these by calling URP's InitializeLightConstants_Common, so the falloff a
+//  bounce uses is the identical curve the direct lighting used, evaluated from identical
+//  numbers. Deriving it again from the Light component would give something plausible that
+//  disagreed, and bounce light that disagrees with its own source looks like a geometry bug
+//  rather than a falloff one.
+// =====================================================================================
+struct PrometheusLight
+{
+    float4 positionType;   ///< xyz position, w = 1 punctual / 0 directional (xyz is the direction)
+    float4 color;          ///< Final colour, intensity and colour space already applied
+    float4 spotDirection;  ///< Spot axis; meaningless for other types
+    float4 attenuation;    ///< xy distance falloff terms, zw spot cone terms
+};
+
+StructuredBuffer<PrometheusLight> _PrometheusLights;
+
+/// Number of entries in _PrometheusLights. The main light is not among them.
+uint _PrometheusLightCount;
+
+/// One light's contribution direction and strength at a point.
+///
+/// Returns false when the light cannot reach the point at all, which lets the caller skip
+/// the shadow ray entirely. That early exit is the whole reason this returns a bool rather
+/// than a zero: a light facing away, or beyond its range, would otherwise cost a full
+/// traversal to prove it contributes nothing.
+///
+/// `rayLength` is how far a shadow ray towards this light should be allowed to travel.
+/// Punctual lights end at the light itself, because geometry behind a lamp cannot shadow it;
+/// clipping the ray there also avoids paying for traversal past anything that matters.
+bool PrometheusEvaluateLight(
+    PrometheusLight light,
+    float3 position,
+    float3 normal,
+    out float3 direction,
+    out float3 radiance,
+    out float rayLength)
+{
+    direction = float3(0.0, 1.0, 0.0);
+    radiance = float3(0.0, 0.0, 0.0);
+    rayLength = 0.0;
+
+    // w carries the type: an offset of zero leaves the direction untouched for a directional
+    // light, and one turns it into the vector from the surface to a punctual light.
+    float3 toLight = light.positionType.xyz - (position * light.positionType.w);
+    float distanceSquared = max(dot(toLight, toLight), 1e-8);
+    float inverseDistance = rsqrt(distanceSquared);
+
+    direction = toLight * inverseDistance;
+
+    float normalDotLight = dot(normal, direction);
+
+    if (normalDotLight <= 0.0)
+    {
+        return false;
+    }
+
+    // URP's distance falloff: inverse square, windowed so it reaches exactly zero at the
+    // light's range instead of trailing off forever. A directional light packs terms that
+    // leave this at one.
+    float lightAttenuation = rcp(distanceSquared);
+    float factor = distanceSquared * light.attenuation.x;
+    float smoothFactor = saturate(1.0 - (factor * factor));
+    smoothFactor = smoothFactor * smoothFactor;
+
+    float attenuation = lightAttenuation * smoothFactor;
+
+    // Spot cone, encoded as a scale and offset so it costs one multiply-add. A non-spot light
+    // packs terms that leave this at one.
+    float spotDot = dot(light.spotDirection.xyz, direction);
+    float spotAttenuation = saturate((spotDot * light.attenuation.z) + light.attenuation.w);
+    attenuation *= spotAttenuation * spotAttenuation;
+
+    if (attenuation <= 1e-5)
+    {
+        return false;
+    }
+
+    radiance = light.color.rgb * attenuation * normalDotLight;
+
+    // A directional light has no position to stop at, so its ray runs to the far clip.
+    rayLength = light.positionType.w > 0.5 ? sqrt(distanceSquared) : 1e5;
+
+    return true;
+}
+
 // =====================================================================================
 //  Node accessors
 // =====================================================================================

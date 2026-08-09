@@ -1,0 +1,1779 @@
+﻿#pragma kernel CS_GenerateShadowRays
+#pragma kernel CS_GenerateAmbientOcclusion
+#pragma kernel CS_GenerateIndirectDiffuse
+#pragma kernel CS_FilterIndirect
+#pragma kernel CS_GenerateReflections
+#pragma kernel CS_FilterReflections
+#pragma target 5.0
+
+#include "Includes/BVHTraversal.hlsl"
+
+// =====================================================================================
+//  Prometheus Software Ray-Tracing Engine
+//  Ray traversal kernels - Phase 5
+//
+//  -----------------------------------------------------------------------------------
+//  BUFFER LAYOUT ANNOTATION (Section 4.3 - HLSL Annotation Standard)
+//  -----------------------------------------------------------------------------------
+//
+//   Register | Binding                    | Type                        | Access
+//   ---------+----------------------------+-----------------------------+-----------
+//   t0       | _PrometheusBvhNodes        | StructuredBuffer, 32 B      | read
+//   t1       | _PrometheusTriangles       | StructuredBuffer, 48 B      | read
+//   t2       | _PrometheusInstances       | StructuredBuffer, 64 B      | read
+//   t3       | _PrometheusInstanceIndices | StructuredBuffer<uint>      | read
+//   t4       | _PrometheusDepthTexture    | Texture2D<float>            | read
+//   t5       | _PrometheusNormalTexture   | Texture2D<float4>           | read
+//   u0       | _RawRayVisibilityMap       | RWTexture2D<float>          | write
+//
+//  t0..t3 are declared in PrometheusStructures.hlsl, which owns the data contract.
+//
+//  CONSTANTS: the scalar and matrix uniforms below are deliberately left in Unity's
+//  implicit global constant buffer rather than an explicit `cbuffer : register(b0)`.
+//  Section 6.1 asks for explicit b0, but an explicitly registered constant buffer in
+//  Unity must be filled with SetComputeConstantBufferParam from a manually packed
+//  GraphicsBuffer; SetComputeVectorParam and friends only reach the implicit buffer.
+//  Taking that route would add a second byte-layout contract to keep in sync with the
+//  CPU, and a per-frame upload, to gain nothing the compiler does not already do.
+//
+//  DISPATCH: 16x16 thread groups, fixed by the Structural Bounds Specification
+//  (Section 3.1). The kernel runs at the sub-sampled resolution, so the caller
+//  dispatches ceil(W * scale / 16) x ceil(H * scale / 16) groups.
+// =====================================================================================
+
+#define PROMETHEUS_THREAD_GROUP_SIZE 16
+#define PROMETHEUS_TWO_PI 6.28318530718
+
+// --- G-Buffer inputs -----------------------------------------------------------------
+
+Texture2D<float>  _PrometheusDepthTexture  : register(t4);
+Texture2D<float4> _PrometheusNormalTexture : register(t5);
+
+// --- Output --------------------------------------------------------------------------
+
+RWTexture2D<float> _RawRayVisibilityMap : register(u0);
+
+/// Ambient occlusion target, written by CS_GenerateAmbientOcclusion. One minus the fraction
+/// of the hemisphere that is blocked, so 1 is open sky and 0 is fully enclosed.
+RWTexture2D<float> _PrometheusAmbientOcclusionMap;
+
+/// (radius, sampleCount, intensity, unused) for the ambient occlusion kernel.
+float4 _PrometheusAoParams;
+
+/// Radiance leaving the surface after one bounce, in RGB. Not a visibility term.
+RWTexture2D<float4> _PrometheusIndirectMap;
+
+/// (sampleCount, intensity, maxDistance, maxBounces) for the indirect kernel.
+float4 _PrometheusIndirectParams;
+
+/// Source for the indirect filter. Separate from the output because a compute kernel cannot
+/// safely read the texture it is writing.
+Texture2D<float4> _PrometheusIndirectSource;
+
+/// (stepSize, depthSigma, normalPower, unused) for the indirect filter.
+float4 _PrometheusFilterParams;
+
+/// Specular radiance arriving along the mirror direction, in RGB.
+RWTexture2D<float4> _PrometheusReflectionMap;
+
+/// (sampleCount, intensity, maxDistance, maxBlurPixels) for the reflection kernel.
+float4 _PrometheusReflectionParams;
+
+/// Source for the reflection filter, kept separate from its output.
+Texture2D<float4> _PrometheusReflectionSource;
+
+/// Colour times intensity of the main light, so the bounce can evaluate what it reflects.
+float4 _PrometheusLightColor;
+
+/// Single-element probe the centre thread writes its reconstructed position into, so the
+/// host can read the actual number instead of inferring it from a picture.
+///   [0] = (worldPosition.xyz, rawDepth)
+///   [1] = (cameraPosition.xyz, 0)
+///   [2] = (rayOrigin.xyz, occluded ? 1 : 0)
+///   [3] = (lightDirection.xyz, dot(normal, lightDirection))
+RWStructuredBuffer<float4> _PrometheusDebugProbe;
+
+// --- Frame constants -----------------------------------------------------------------
+
+/// Inverse of the GPU view-projection matrix, for reconstructing world position.
+float4x4 _PrometheusInvViewProjection;
+
+/// Forward view-projection. Used only by the REPROJECT_ERROR debug channel, which needs to
+/// send a reconstructed position back to the screen it came from.
+float4x4 _PrometheusViewProjection;
+
+/// World-space camera position. Only .xyz is used.
+float4 _PrometheusCameraPosition;
+
+/// Direction *towards* the light in world space, normalised. Only .xyz is used.
+float4 _PrometheusLightDirection;
+
+/// (width, height, 1/width, 1/height) of the sub-sampled ray target.
+float4 _PrometheusTargetSize;
+
+/// (width, height, 1/width, 1/height) of the full-resolution depth source.
+float4 _PrometheusDepthTargetSize;
+
+/// (tMin, tMax, normalBias, reversedZ ? 1 : 0).
+float4 _PrometheusRayParams;
+
+/// (hasNormalTexture, normalEncoding, uvStartsAtTop, unused).
+float4 _PrometheusFeatureFlags;
+
+/// (debugMode, worldScale, lightResolved, unused). See the debug channel table below.
+float4 _PrometheusDebugParams;
+
+/// (angularRadius, sampleCount, frameIndex, unused) for soft shadows.
+float4 _PrometheusShadowParams;
+
+// =====================================================================================
+//  DEBUG CHANNELS
+//
+//  _RawRayVisibilityMap is a single-channel R8 target, so each mode writes one scalar.
+//  Set the mode on the render feature; no recompile is needed. Modes 0-8, 12 and 16-17
+//  bypass the trace, so a wrong result isolates the stage rather than compounding through
+//  it. Modes 9-11 and 13-15 consult the acceleration structure on purpose, because they
+//  exist to inspect traversal once everything feeding it has been shown good.
+//
+//  16 LIGHT_X and 17 LIGHT_Z complete 6 LIGHT_Y. One component cannot describe a
+//  direction, and reading Y alone is how a sun that is actually overhead gets mistaken for
+//  one that is not.
+//
+//   0 OFF          normal operation
+//   1 RAW_DEPTH    the depth sample verbatim. Flat 0 or flat 1 means depth is not bound,
+//                  or the whole frame is being read as sky.
+//   2 VIEW_DIST    |worldPos - cameraPos| / worldScale. A smooth near-to-far ramp proves
+//                  the inverse view-projection reconstructs correctly. This is the mode
+//                  that settles the camera-relative question: if reconstruction were in a
+//                  different space from the camera position, this would not ramp smoothly
+//                  from the near plane.
+//   3 WORLD_HEIGHT frac(worldPos.y / worldScale). Banding that follows scene geometry
+//                  means world positions are real; a flat or wild value means they are not.
+//   4 NORMAL_Y     normal.y remapped to [0,1]. 0.5 means a zero normal, which is the
+//                  signature of an unbound or mis-decoded normal target.
+//   5 NDOTL        saturate(dot(normal, lightDir)). Flat black here is why the whole
+//                  target goes black in normal operation.
+//   6 LIGHT_Y      lightDirection.y remapped to [0,1]. 0.5 means the light vector arrived
+//                  as zero and never reached the shader.
+//   7 TLAS_READY   1 when the acceleration structure has nodes, 0 when it does not.
+//                  Proves whether the TLAS reached the GPU at all.
+//   8 FORCE_LIT    writes 1.0 unconditionally. Proves the dispatch, the UAV binding and
+//                  the target itself are working before anything else is questioned.
+// =====================================================================================
+
+#define PROMETHEUS_DEBUG_OFF           0
+#define PROMETHEUS_DEBUG_RAW_DEPTH     1
+#define PROMETHEUS_DEBUG_VIEW_DIST     2
+#define PROMETHEUS_DEBUG_WORLD_HEIGHT  3
+#define PROMETHEUS_DEBUG_NORMAL_Y      4
+#define PROMETHEUS_DEBUG_NDOTL         5
+#define PROMETHEUS_DEBUG_LIGHT_Y       6
+#define PROMETHEUS_DEBUG_TLAS_READY    7
+#define PROMETHEUS_DEBUG_FORCE_LIT     8
+#define PROMETHEUS_DEBUG_HIT_DISTANCE  9
+#define PROMETHEUS_DEBUG_SELF_HIT     10
+#define PROMETHEUS_DEBUG_OCCLUDER_ID  11
+#define PROMETHEUS_DEBUG_LIGHT_SOURCE 12
+#define PROMETHEUS_DEBUG_ROOT_INSIDE  13
+#define PROMETHEUS_DEBUG_ROOT_HIT     14
+#define PROMETHEUS_DEBUG_DOWN_HIT     15
+#define PROMETHEUS_DEBUG_LIGHT_X      16
+#define PROMETHEUS_DEBUG_LIGHT_Z      17
+#define PROMETHEUS_DEBUG_SCREEN_X     18
+#define PROMETHEUS_DEBUG_SCREEN_Y     19
+#define PROMETHEUS_DEBUG_REPROJECT    20
+#define PROMETHEUS_DEBUG_FLOOR_MATCH  21
+
+// =====================================================================================
+//  ABSOLUTE POSITION
+//
+//  21 FLOOR_MATCH lights only the pixels whose reconstructed position lies within a few
+//  centimetres of world y = 0, and blackens everything else.
+//
+//  Every other position check compares the reconstruction against itself. REPROJECT sends
+//  a point back through the forward matrix, which returns it to the pixel it came from no
+//  matter how wrong its depth was, because an error along the view ray lands on the same
+//  screen position. VIEW_DIST and WORLD_HEIGHT likewise stay plausible under a scale error.
+//  None of them can see a point that is metres from the real surface.
+//
+//  This one compares against a fact outside the shader: the floor plane is at y = 0, and
+//  the viewer knows where the floor is on screen. The lit region must coincide with the
+//  visible floor and nothing else. Anywhere else, or nowhere, means the ray origins are
+//  not on the surfaces being shaded, which is a depth reconstruction fault and would put
+//  shadows in the wrong place while tracking the camera exactly as reported.
+// =====================================================================================
+
+// =====================================================================================
+//  SCREEN ALIGNMENT
+//
+//  Read these in the Game view, not the Frame Debugger. They write a pattern whose
+//  correct appearance is known in advance, so URP samples it through the real shadow
+//  lookup and any disagreement between where a value is written and where it is read
+//  shows up directly in the shaded image.
+//
+//  A shadow buffer that is misaligned with the screen looks exactly like a shadow
+//  attached to the camera: the pattern is fixed in screen space, so it slides across the
+//  world as the view moves, and sits somewhere other than the geometry casting it.
+//
+//  18 SCREEN_X    writes uv.x. The scene must darken smoothly from LEFT to RIGHT. If it
+//                 darkens right to left the buffer is mirrored horizontally.
+//  19 SCREEN_Y    writes uv.y. The scene must darken smoothly from BOTTOM to TOP. If it
+//                 darkens top to bottom the buffer is mirrored vertically, which is the
+//                 usual outcome when a render-texture Y convention is applied twice or
+//                 not at all.
+//  20 REPROJECT   sends the reconstructed world position back through the forward
+//                 view-projection and reports how far it lands from the pixel it came
+//                 from. Black everywhere means the reconstruction agrees with the texel
+//                 it was computed for. Anything bright means it does not, and the ray
+//                 was traced from a surface other than the one being shaded.
+//
+//  Together they localise the fault: 18 and 19 test the write-to-read mapping, 20 tests
+//  the reconstruction. A gradient that runs the wrong way points at the binding; a clean
+//  gradient with a bright REPROJECT points at the matrix.
+// =====================================================================================
+
+// =====================================================================================
+//  SPATIAL FRAME AGREEMENT
+//
+//  Modes 1-6 all pass while the ray origin sits in the wrong place. RAW_DEPTH, NORMAL_Y
+//  and NDOTL never touch the reconstructed position at all, and VIEW_DIST and
+//  WORLD_HEIGHT only show that it varies smoothly with depth - which stays true under a
+//  translation or a scale error. None of them compare the position against anything the
+//  BVH knows about, so none of them can detect a frame mismatch.
+//
+//  These three do, by referring the origin to the acceleration structure itself:
+//
+//  13 ROOT_INSIDE  1 where the ray origin lies inside the TLAS root AABB. Every visible
+//                  surface is scene geometry, so every shaded pixel must be inside the
+//                  box that encloses that geometry. Frame-wide black is a direct
+//                  contradiction and means the origin and the BVH disagree spatially.
+//  14 ROOT_HIT     1 where the shadow ray meets the root AABB at all. Black here with
+//                  white in ROOT_INSIDE is a direction or range fault rather than a
+//                  position one.
+//  15 DOWN_HIT     traces straight down, ignoring the light. Everything in a scene with
+//                  a floor has something beneath it, so black means geometry is
+//                  unreachable from the origin no matter which way the ray points, which
+//                  separates a broken BVH from a wrong light vector.
+// =====================================================================================
+
+// =====================================================================================
+//  TRAVERSAL DIAGNOSIS
+//
+//  The modes above verify everything feeding the trace. These four inspect the trace
+//  itself, which is what remains once depth, reconstruction, normals and the light have
+//  all been shown good but the target is still black.
+//
+//   9 HIT_DISTANCE  distance to the first occluder / worldScale; white means the ray
+//                   escaped. A near-uniform mid value means every ray is stopped at the
+//                   same height, which is what an enclosing roof looks like. A uniform
+//                   near-zero means rays are re-hitting the surface they started on.
+//  10 SELF_HIT      1 where the first hit is within a few multiples of the bias, which
+//                   is the unambiguous signature of self-intersection. All black here
+//                   means the occluders are real geometry, not the origin surface.
+//  11 OCCLUDER_ID   the blocking instance's index, banded so neighbours differ. One flat
+//                   band over the whole frame means a single object is shadowing
+//                   everything, which for an indoor scene is almost always the ceiling.
+//  12 LIGHT_SOURCE  1 when a real directional light was resolved, 0 when the host fell
+//                   back to straight up. LIGHT_Y cannot tell these apart, because the
+//                   fallback and a downward sun both read near 1.
+// =====================================================================================
+
+/// Current debug mode, rounded from the uniform.
+int PrometheusDebugMode()
+{
+    return (int)(_PrometheusDebugParams.x + 0.5);
+}
+
+/// Eight-pixel checkerboard, used to answer "does this shader implement that mode?".
+///
+/// Nothing in a scene produces regular squares, so this cannot be misread as a result. It
+/// is the marker for a mode number the shader does not recognise, which in practice means
+/// the host is newer than the compiled shader.
+float PrometheusDebugCheckerboard(uint2 pixel)
+{
+    return ((pixel.x >> 3) + (pixel.y >> 3)) & 1 ? 1.0 : 0.0;
+}
+
+// =====================================================================================
+//  Ray generation
+// =====================================================================================
+
+/// True when the sampled depth sits on the far plane, meaning nothing was rasterised.
+///
+/// The comparison flips with the depth convention, so the caller passes the platform's
+/// choice in rather than this file depending on a Unity shader-library define.
+bool PrometheusIsSkyDepth(float rawDepth, bool reversedZ)
+{
+    return reversedZ ? (rawDepth <= 0.0) : (rawDepth >= 1.0);
+}
+
+/// Reconstructs a world-space position from a depth sample and its normalised UV.
+///
+/// No platform Y flip is applied here, deliberately. The inverse matrix supplied by the
+/// host is built from GL.GetGPUProjectionMatrix with renderIntoTexture set, which already
+/// carries whatever clip-space convention the platform uses. Flipping again on top of that
+/// mirrors every reconstructed position vertically, which places the ray origin on the
+/// wrong surface and makes the traced result silently wrong rather than obviously broken.
+///
+/// Reversed-Z needs no special handling for the same reason: the depth value is fed through
+/// unchanged and the matrix accounts for the direction. Only the sky test has to know, and
+/// it is told through _PrometheusRayParams.w.
+/// Whether this platform's clip space is vertically flipped relative to texel space.
+///
+/// Supplied by the host rather than read from UNITY_UV_STARTS_AT_TOP, which is a
+/// vertex/fragment define and is simply absent in a compute shader: relying on it here
+/// compiled cleanly, reported nothing, and left the flip permanently disabled.
+float PrometheusFlipApplied()
+{
+    return _PrometheusFeatureFlags.z;
+}
+
+float3 PrometheusReconstructWorldPosition(float2 uv, float rawDepth)
+{
+    float2 ndc = (uv * 2.0) - 1.0;
+
+    // Clip space is flipped vertically on every platform where texture row zero is the top,
+    // and that flip is baked into the projection matrix. Going the other way, from a texel
+    // back to clip space, it has to be undone by hand. URP's own
+    // ComputeNormalizedDeviceCoordinatesWithZ does exactly this and says so in a comment;
+    // an earlier revision of this file removed it on the assumption that the matrix already
+    // covered both directions.
+    //
+    // Without it the depth sample comes from one row while the ray direction comes from its
+    // mirror image, so the reconstructed point lands at the right distance from the camera
+    // along the wrong ray: measured here as 1.93 units across the view ray against 0.54 along
+    // it, floating 1.32 from the nearest surface. Every shadow ray then started from a point
+    // in mid-air, and because the mirror is in screen space it stayed welded to the viewport,
+    // which is why the shadows tracked the camera instead of the geometry.
+    ndc.y = PrometheusFlipApplied() > 0.5 ? -ndc.y : ndc.y;
+
+    float4 clip = float4(ndc, rawDepth, 1.0);
+    float4 world = mul(_PrometheusInvViewProjection, clip);
+
+    // Absolute world space, measured rather than assumed: adding the camera position here,
+    // which an earlier revision did, offsets every ray origin by exactly that vector.
+    return world.xyz / world.w;
+}
+
+/// Inverse of URP's PackFloat2To888, for the deferred renderer's octahedral normals.
+float2 PrometheusUnpack888ToFloat2(float3 packed)
+{
+    uint3 i = (uint3)(packed * 255.5);
+    uint hi = i.z >> 4;
+    uint lo = i.z & 15;
+    uint2 cb = i.xy | (uint2(lo, hi) << 8);
+    return cb / 4095.0;
+}
+
+/// Decodes an octahedral normal produced by PackNormalOctQuadEncode.
+float3 PrometheusDecodeOctNormal(float2 f)
+{
+    f = f * 2.0 - 1.0;
+    float3 n = float3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
+    float t = saturate(-n.z);
+    n.xy += n.xy >= 0.0 ? -t : t;
+    return normalize(n);
+}
+
+/// Decodes a G-buffer normal sample into a unit world-space normal.
+///
+/// URP writes two different things into _CameraNormalsTexture depending on the renderer,
+/// and getting this wrong is not a subtle visual artefact: a mis-decoded normal fails the
+/// N.L test and offsets the ray origin the wrong way, so every pixel reports itself
+/// occluded and the whole target comes out black.
+///
+///   Forward  (PROMETHEUS_NORMAL_RAW): outNormalWS = half4(normalWS, 0), the raw world
+///            normal in [-1, 1] written into an R8G8B8A8_SNorm target. It needs no
+///            remapping at all; applying the usual *2-1 would send it to [-3, 1].
+///   Deferred (PROMETHEUS_NORMAL_OCT): octahedral, packed to 888 and remapped to [0, 1].
+///
+/// The host selects the convention through _PrometheusFeatureFlags.y.
+float3 PrometheusDecodeSceneNormal(float4 encoded, float encodingMode)
+{
+    float3 decoded = encodingMode > 0.5
+        ? PrometheusDecodeOctNormal(PrometheusUnpack888ToFloat2(encoded.xyz))
+        : encoded.xyz;
+
+    return decoded;
+}
+
+/// Growth in the offset per world unit of view distance.
+///
+/// The depth buffer quantises non-linearly, so a reconstructed point drifts further from
+/// the true surface the further away it is. One percent per unit keeps the near field
+/// tight while still clearing the surface out at the far plane.
+#define PROMETHEUS_BIAS_DISTANCE_SLOPE 0.01
+
+/// Ceiling on the grazing-angle multiplier, in units of the base offset.
+///
+/// tan(theta) diverges as the surface turns edge-on to the light, and an unbounded offset
+/// there would launch the ray far enough to skip real occluders. Eight is past the point
+/// where N-dot-L has already darkened the surface to near nothing.
+#define PROMETHEUS_BIAS_MAX_SLOPE 8.0
+
+/// Offsets a ray origin off the surface it starts on.
+///
+/// Without this the ray immediately re-intersects the triangle that spawned it and every
+/// pixel shadows itself.
+/// The caller guarantees `normal` is unit length, falling back to the light direction when
+/// no usable normal exists, so the direction of the offset is always well defined.
+///
+/// The magnitude is not constant, because the error being corrected is not. Two terms scale
+/// it, and both are needed:
+///
+///   distance  Reconstructing from a quantised depth buffer misplaces the point along the
+///             view ray by an error that grows with distance. An offset that clears the
+///             surface near the camera sits inside it far away, which is what turns a
+///             distant lit surface uniformly black.
+///   grazing   As the surface turns edge-on to the light the ray runs nearly parallel to
+///             it, so the same perpendicular offset buys far less clearance along the ray.
+///             This is the classic acne term and it is why the scaling is by tan(theta)
+///             rather than by anything symmetric in N-dot-L.
+///
+/// Scaling by distance alone would over-bias head-on surfaces and cost contact shadows, so
+/// the grazing term is kept separate rather than folded into a single fudge factor.
+float3 PrometheusOffsetRayOrigin(
+    float3 position,
+    float3 normal,
+    float bias,
+    float viewDistance,
+    float ndotl)
+{
+    float distanceScale = 1.0 + viewDistance * PROMETHEUS_BIAS_DISTANCE_SLOPE;
+
+    float cosTheta = clamp(ndotl, 1e-3, 1.0);
+    float tanTheta = sqrt(saturate(1.0 - cosTheta * cosTheta)) / cosTheta;
+    float grazingScale = 1.0 + min(tanTheta, PROMETHEUS_BIAS_MAX_SLOPE);
+
+    return position + normal * (bias * distanceScale * grazingScale);
+}
+
+/// Interleaved gradient noise, the standard cheap per-pixel decorrelator.
+///
+/// Takes a frame index so callers can choose. Occlusion passes zero and gets a sequence
+/// fixed in place, which is stable to look at and easy to filter spatially. Soft shadows
+/// advance it every frame, because their estimate is meant to converge over time rather
+/// than be blurred, and a sequence that never changes can never converge to anything.
+float PrometheusInterleavedGradientNoise(uint2 pixel, float frameIndex)
+{
+    float2 coordinate = float2(pixel) + (frameIndex * 5.588238);
+    return frac(52.9829189 * frac(dot(coordinate, float2(0.06711056, 0.00583715))));
+}
+
+/// Two decorrelated values from an integer seed. Used for path directions past the first
+/// bounce, where a low-discrepancy set buys nothing because each path has diverged.
+float2 PrometheusHash2(uint seed)
+{
+    seed = (seed * 747796405u) + 2891336453u;
+
+    uint word = ((seed >> ((seed >> 28u) + 4u)) ^ seed) * 277803737u;
+    word = (word >> 22u) ^ word;
+
+    return float2(word & 0xFFFFu, (word >> 16u) & 0xFFFFu) * (1.0 / 65535.0);
+}
+
+/// Cosine-weighted direction in the hemisphere around a normal.
+///
+/// The projected-area term of the diffuse integral is carried by the distribution, so an
+/// estimator built on this needs no per-sample weight.
+float3 PrometheusCosineDirection(float2 xi, float rotation, float3 normal, float3 tangent, float3 bitangent)
+{
+    float phi = (xi.y * PROMETHEUS_TWO_PI) + rotation;
+
+    float cosTheta = sqrt(1.0 - xi.x);
+    float sinTheta = sqrt(xi.x);
+
+    return (tangent * (sinTheta * cos(phi))) +
+           (bitangent * (sinTheta * sin(phi))) +
+           (normal * cosTheta);
+}
+
+/// Hammersley point set, giving low-discrepancy coverage of the hemisphere for few samples.
+float2 PrometheusHammersley(uint index, uint count)
+{
+    uint bits = index;
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+
+    return float2(index / (float)count, bits * 2.3283064365386963e-10);
+}
+
+/// Builds an arbitrary orthonormal basis around a unit vector.
+///
+/// Frisvad's method, with the branch that avoids the singularity when the normal points
+/// along negative Z. Cross products against a fixed axis fail exactly there.
+void PrometheusBuildBasis(float3 normal, out float3 tangent, out float3 bitangent)
+{
+    if (normal.z < -0.999999)
+    {
+        tangent = float3(0.0, -1.0, 0.0);
+        bitangent = float3(-1.0, 0.0, 0.0);
+        return;
+    }
+
+    float a = 1.0 / (1.0 + normal.z);
+    float b = -normal.x * normal.y * a;
+
+    tangent = float3(1.0 - normal.x * normal.x * a, b, -normal.x);
+    bitangent = float3(b, 1.0 - normal.y * normal.y * a, -normal.y);
+}
+
+// =====================================================================================
+//  Kernels
+// =====================================================================================
+
+/// Casts one shadow ray per sub-sampled pixel towards the primary directional light and
+/// writes binary visibility into _RawRayVisibilityMap.
+///
+/// Output is deliberately hard 0.0 or 1.0: this is the raw ray target that the Phase 6
+/// SVGF denoiser consumes, and any pre-filtering here would destroy the variance signal
+/// the reconstruction depends on.
+[numthreads(PROMETHEUS_THREAD_GROUP_SIZE, PROMETHEUS_THREAD_GROUP_SIZE, 1)]
+void CS_GenerateShadowRays(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint2 pixel = dispatchThreadId.xy;
+
+    // Dispatch rounds up to whole thread groups, so the tail threads fall outside.
+    if (pixel.x >= (uint)_PrometheusTargetSize.x || pixel.y >= (uint)_PrometheusTargetSize.y)
+    {
+        return;
+    }
+
+    int debugMode = PrometheusDebugMode();
+
+    // Deliberately the very first thing, before any input is read. If this does not produce a
+    // white target then the problem is upstream of the shader entirely: the dispatch, the UAV
+    // binding, or the target being read back.
+    if (debugMode == PROMETHEUS_DEBUG_FORCE_LIT)
+    {
+        _RawRayVisibilityMap[pixel] = 1.0;
+        return;
+    }
+
+    // Ahead of every early-out, including the sky test, so a stale shader cannot hide behind
+    // a pixel that returns before reaching the fall-through guard at the end of the kernel.
+    // Mode numbers are contiguous, so one above the highest this shader knows means the host
+    // is newer than the compiled code and no reading taken from it means anything.
+    if (debugMode > PROMETHEUS_DEBUG_FLOOR_MATCH)
+    {
+        _RawRayVisibilityMap[pixel] = PrometheusDebugCheckerboard(pixel);
+        return;
+    }
+
+    if (debugMode == PROMETHEUS_DEBUG_TLAS_READY)
+    {
+        _RawRayVisibilityMap[pixel] = _PrometheusTlasNodeCount > 0u ? 1.0 : 0.0;
+        return;
+    }
+
+    // The host sets this when it resolved an actual directional light, so a fallback reads as
+    // black here. LIGHT_Y cannot make that distinction: the fallback is straight up, and a sun
+    // angled steeply downward also has a near-unit +Y component, so both look identical there.
+    if (debugMode == PROMETHEUS_DEBUG_LIGHT_SOURCE)
+    {
+        _RawRayVisibilityMap[pixel] = _PrometheusDebugParams.z;
+        return;
+    }
+
+    float2 uv = (pixel + 0.5) * _PrometheusTargetSize.zw;
+
+    // Deliberately ahead of the depth read and the sky test: these describe the target's own
+    // addressing, not the scene, and must cover every pixel to be read as a gradient.
+    if (debugMode == PROMETHEUS_DEBUG_SCREEN_X)
+    {
+        _RawRayVisibilityMap[pixel] = uv.x;
+        return;
+    }
+
+    if (debugMode == PROMETHEUS_DEBUG_SCREEN_Y)
+    {
+        _RawRayVisibilityMap[pixel] = uv.y;
+        return;
+    }
+
+    // Nearest full-resolution texel. A point fetch is correct here: filtering depth
+    // across a silhouette would reconstruct a position that lies on neither surface.
+    int2 depthPixel = int2(uv * _PrometheusDepthTargetSize.xy);
+    depthPixel = clamp(depthPixel, int2(0, 0), int2(_PrometheusDepthTargetSize.xy) - 1);
+
+    float rawDepth = _PrometheusDepthTexture.Load(int3(depthPixel, 0)).r;
+    bool reversedZ = _PrometheusRayParams.w > 0.5;
+
+    // Shown for every pixel including sky, so a completely unbound depth target reads as a
+    // flat value rather than being masked by the sky early-out below.
+    if (debugMode == PROMETHEUS_DEBUG_RAW_DEPTH)
+    {
+        _RawRayVisibilityMap[pixel] = saturate(rawDepth);
+        return;
+    }
+
+    if (PrometheusIsSkyDepth(rawDepth, reversedZ))
+    {
+        // Nothing was drawn here, so nothing can be shadowed.
+        _RawRayVisibilityMap[pixel] = 1.0;
+        return;
+    }
+
+    float3 worldPosition = PrometheusReconstructWorldPosition(uv, rawDepth);
+
+    // One thread, once per dispatch. Estimating this offset from a screenshot is what has kept
+    // this open; the probe reports it exactly.
+    // Quarter height, not centre. The centre pixel is the fixed point of a vertical mirror,
+    // so a Y-convention fault in the reconstruction is invisible there; this offset makes it
+    // the dominant term in the error.
+    if (all(pixel == (uint2)(_PrometheusTargetSize.xy * float2(0.5, 0.25))))
+    {
+        _PrometheusDebugProbe[0] = float4(worldPosition, rawDepth);
+        // W reports whether the vertical flip compiled in, so a platform define that is not
+        // set cannot make the fix a silent no-op.
+        _PrometheusDebugProbe[1] = float4(_PrometheusCameraPosition.xyz, PrometheusFlipApplied());
+    }
+
+    // Also drives the ray offset, because the depth-reconstruction error this corrects for
+    // grows with distance. See PrometheusOffsetRayOrigin.
+    float viewDistance = length(worldPosition - _PrometheusCameraPosition.xyz);
+
+    float worldScale = max(_PrometheusDebugParams.y, 1e-3);
+
+    if (debugMode == PROMETHEUS_DEBUG_VIEW_DIST)
+    {
+        // Both operands must live in the same space for this to ramp smoothly; a mismatch
+        // shows up immediately as a flat or discontinuous field.
+        _RawRayVisibilityMap[pixel] = saturate(viewDistance / worldScale);
+        return;
+    }
+
+    // Round trip: screen -> world -> screen. Any disagreement between the inverse matrix
+    // and the texel addressing shows up here as a non-zero residual, and a mirrored axis
+    // shows up as a dark band along the axis of symmetry with bright edges either side.
+    if (debugMode == PROMETHEUS_DEBUG_REPROJECT)
+    {
+        float4 clip = mul(_PrometheusViewProjection, float4(worldPosition, 1.0));
+        float2 reprojected = (clip.xy / max(abs(clip.w), 1e-6) * sign(clip.w)) * 0.5 + 0.5;
+
+        // Scaled so that a residual of a tenth of the screen saturates: this has to read as
+        // pass or fail, not as a field to interpret.
+        _RawRayVisibilityMap[pixel] = saturate(length(reprojected - uv) * 10.0);
+        return;
+    }
+
+    if (debugMode == PROMETHEUS_DEBUG_FLOOR_MATCH)
+    {
+        // Five centimetres: far tighter than any plausible shadow displacement, far looser
+        // than depth-buffer quantisation on a surface this close to the camera.
+        _RawRayVisibilityMap[pixel] = abs(worldPosition.y) < 0.05 ? 1.0 : 0.0;
+        return;
+    }
+
+    if (debugMode == PROMETHEUS_DEBUG_WORLD_HEIGHT)
+    {
+        _RawRayVisibilityMap[pixel] = frac(worldPosition.y / worldScale);
+        return;
+    }
+
+    // A zero light vector normalises to NaN, and every later comparison against NaN is false,
+    // so the surface would silently take the unlit path. Fall back to straight up instead.
+    float3 rawLight = _PrometheusLightDirection.xyz;
+    float lightLengthSquared = dot(rawLight, rawLight);
+    float3 lightDirection = lightLengthSquared > 1e-8
+        ? rawLight * rsqrt(lightLengthSquared)
+        : float3(0.0, 1.0, 0.0);
+
+    // Read all three together to recover the vector: each is a component remapped from
+    // [-1,1] to [0,1], so 0.5 is zero, black is -1 and white is +1. A sun described as
+    // "shining sideways" must show a near-0.5 Y and a saturated X or Z; a saturated Y means
+    // it is overhead whatever the scene looks like, and its shadows will be short.
+    if (debugMode == PROMETHEUS_DEBUG_LIGHT_Y)
+    {
+        _RawRayVisibilityMap[pixel] = saturate(lightDirection.y * 0.5 + 0.5);
+        return;
+    }
+
+    if (debugMode == PROMETHEUS_DEBUG_LIGHT_X)
+    {
+        _RawRayVisibilityMap[pixel] = saturate(lightDirection.x * 0.5 + 0.5);
+        return;
+    }
+
+    if (debugMode == PROMETHEUS_DEBUG_LIGHT_Z)
+    {
+        _RawRayVisibilityMap[pixel] = saturate(lightDirection.z * 0.5 + 0.5);
+        return;
+    }
+
+    // Falls back to the light direction when no normal buffer is bound, which is a valid
+    // configuration rather than an error.
+    bool hasNormal = _PrometheusFeatureFlags.x > 0.5;
+    float3 normal = lightDirection;
+
+    if (hasNormal)
+    {
+        float3 decoded = PrometheusDecodeSceneNormal(
+            _PrometheusNormalTexture.Load(int3(depthPixel, 0)), _PrometheusFeatureFlags.y);
+
+        // An unbound or cleared normal target reads as zero, and normalising that yields
+        // NaN. Every subsequent comparison against NaN is false, so the surface would fail
+        // the N.L test and be biased along a NaN axis: the entire target would come out
+        // black with nothing to indicate why. Treat a degenerate sample as "no normal here"
+        // and let this pixel fall back rather than poisoning it.
+        float lengthSquared = dot(decoded, decoded);
+
+        if (lengthSquared > 1e-6)
+        {
+            normal = decoded * rsqrt(lengthSquared);
+        }
+        else
+        {
+            hasNormal = false;
+        }
+    }
+
+    if (debugMode == PROMETHEUS_DEBUG_NORMAL_Y)
+    {
+        _RawRayVisibilityMap[pixel] = saturate(normal.y * 0.5 + 0.5);
+        return;
+    }
+
+    if (debugMode == PROMETHEUS_DEBUG_NDOTL)
+    {
+        _RawRayVisibilityMap[pixel] = saturate(dot(normal, lightDirection));
+        return;
+    }
+
+    // Placed ahead of the N-dot-L rejection on purpose. These answer "is the ray origin in
+    // the same space as the geometry", which is a question about the whole frame, so
+    // discarding the back-facing half of it before asking would hide exactly the pixels
+    // most worth checking.
+    if (debugMode == PROMETHEUS_DEBUG_ROOT_INSIDE ||
+        debugMode == PROMETHEUS_DEBUG_ROOT_HIT ||
+        debugMode == PROMETHEUS_DEBUG_DOWN_HIT)
+    {
+        float3 probeOrigin = PrometheusOffsetRayOrigin(
+            worldPosition, normal, _PrometheusRayParams.z, viewDistance, dot(normal, lightDirection));
+        float readout = 0.0;
+
+        if (_PrometheusTlasNodeCount > 0u)
+        {
+            if (debugMode == PROMETHEUS_DEBUG_DOWN_HIT)
+            {
+                readout = PrometheusTraceShadowRay(
+                    probeOrigin, float3(0.0, -1.0, 0.0),
+                    _PrometheusRayParams.x, _PrometheusRayParams.y) ? 1.0 : 0.0;
+            }
+            else
+            {
+                // Node zero is the TLAS root, so its box encloses every instance in the
+                // scene. Comparing the origin against it needs no traversal at all.
+                PrometheusBVHNode root = _PrometheusBvhNodes[0];
+
+                if (debugMode == PROMETHEUS_DEBUG_ROOT_INSIDE)
+                {
+                    // A surface point sits exactly on its own bounding box face, so an exact
+                    // containment test would flicker on rounding alone.
+                    float3 slack = (root.boundsMax - root.boundsMin) * 0.001 + 0.01;
+                    bool inside = all(probeOrigin >= root.boundsMin - slack) &&
+                                  all(probeOrigin <= root.boundsMax + slack);
+                    readout = inside ? 1.0 : 0.0;
+                }
+                else
+                {
+                    float3 invDirection = PrometheusSafeRcpDirection(lightDirection);
+                    readout = PrometheusIntersectAabb(
+                        root, probeOrigin, invDirection, _PrometheusRayParams.y) ? 1.0 : 0.0;
+                }
+            }
+        }
+
+        _RawRayVisibilityMap[pixel] = readout;
+        return;
+    }
+
+    // A surface facing away from the light is unlit regardless of occluders, and tracing it
+    // would only ever find the surface itself.
+    if (hasNormal && dot(normal, lightDirection) <= 0.0)
+    {
+        _RawRayVisibilityMap[pixel] = 0.0;
+        return;
+    }
+
+    float3 rayOrigin = PrometheusOffsetRayOrigin(
+        worldPosition, normal, _PrometheusRayParams.z, viewDistance, dot(normal, lightDirection));
+
+    // These three share the closest-hit walk, which the shipping path never takes: an any-hit
+    // trace stops at the first occluder it finds and so cannot report which one it was or how
+    // far away. They are strictly diagnostic and cost a full traversal.
+    //
+    // Pixels the N-dot-L test already rejected never reach here and read black in all three;
+    // NDOTL identifies those, so cross-reference the two before reading a black region as a
+    // near hit.
+    if (debugMode == PROMETHEUS_DEBUG_HIT_DISTANCE ||
+        debugMode == PROMETHEUS_DEBUG_SELF_HIT ||
+        debugMode == PROMETHEUS_DEBUG_OCCLUDER_ID)
+    {
+        PrometheusHit probe = PrometheusTraceClosestHit(
+            rayOrigin, lightDirection, _PrometheusRayParams.x, _PrometheusRayParams.y);
+
+        float readout;
+
+        if (debugMode == PROMETHEUS_DEBUG_HIT_DISTANCE)
+        {
+            // White is a clean escape to the light. Anything darker is an occluder, shaded by
+            // how far along the ray it sits.
+            readout = probe.isHit ? saturate(probe.distance / worldScale) : 1.0;
+        }
+        else if (debugMode == PROMETHEUS_DEBUG_SELF_HIT)
+        {
+            // Four bias widths: comfortably past the offset the ray origin already received,
+            // yet far short of any occluder that is genuinely separate geometry.
+            float selfHitRadius = max(_PrometheusRayParams.z, _PrometheusRayParams.x) * 4.0;
+            readout = probe.isHit && probe.distance < selfHitRadius ? 1.0 : 0.0;
+        }
+        else
+        {
+            // Banded rather than scaled, because the instance count is not known here. Adjacent
+            // instances land in visibly different bands, which is all this needs to answer:
+            // one flat band over the frame means one object is shadowing everything.
+            readout = probe.isHit ? frac(probe.instanceIndex * 0.0625 + 0.0625) : 0.0;
+        }
+
+        _RawRayVisibilityMap[pixel] = readout;
+        return;
+    }
+
+    // Every implemented mode has returned by now, so anything still here asked for a channel
+    // this shader does not have. Falling through to the trace would answer with real
+    // visibility under a debug label: plausible, scene-shaped, and completely misleading.
+    //
+    // The usual cause is a stale compile. Unity does not always rebuild a .compute when only
+    // an included .hlsl changed, and the mode is host-side state, so a shader built before a
+    // mode existed still runs and still receives the new mode number.
+    //
+    // A checkerboard cannot be mistaken for anything the scene produces, which turns "is the
+    // GPU running my shader?" into a one-frame test: select any debug mode at all. Squares
+    // mean the shader is current. Shadows mean it is not, and every reading taken from a mode
+    // added in the same edit is worthless.
+    if (debugMode != PROMETHEUS_DEBUG_OFF)
+    {
+        _RawRayVisibilityMap[pixel] = PrometheusDebugCheckerboard(pixel);
+        return;
+    }
+
+    // A directional light is not a point. The sun subtends about half a degree, and it is
+    // that finite width which produces penumbra: sharp where an occluder touches the
+    // receiver, widening with the gap between them. Tracing one ray at the exact centre
+    // direction can only ever answer yes or no, which is why the result was perfectly hard.
+    //
+    // Sampling the light's disc turns visibility into a fraction, and contact hardening then
+    // falls out of the geometry for free rather than being approximated by a filter width.
+    // No shadow map can produce this: its penumbra is a property of the filter kernel, not of
+    // how far away the blocker is.
+    float angularRadius = max(_PrometheusShadowParams.x, 0.0);
+    uint shadowSamples = (uint)max(_PrometheusShadowParams.y, 1.0);
+
+    float visibility;
+
+    if (angularRadius <= 1e-5 || shadowSamples == 1u)
+    {
+        // A point light source, or a single sample: no disc to integrate over, so take the
+        // centre direction and keep the cheaper binary answer.
+        visibility = PrometheusTraceShadowRay(
+            rayOrigin, lightDirection, _PrometheusRayParams.x, _PrometheusRayParams.y)
+            ? 0.0 : 1.0;
+    }
+    else
+    {
+        float3 lightTangent;
+        float3 lightBitangent;
+        PrometheusBuildBasis(lightDirection, lightTangent, lightBitangent);
+
+        // Advanced per frame so the estimate converges through the temporal denoiser rather
+        // than freezing one particular pattern of grain into the image.
+        float rotation =
+            PrometheusInterleavedGradientNoise(pixel, _PrometheusShadowParams.z) * PROMETHEUS_TWO_PI;
+
+        float unoccluded = 0.0;
+
+        [loop]
+        for (uint shadowIndex = 0u; shadowIndex < shadowSamples; shadowIndex++)
+        {
+            float2 xi = PrometheusHammersley(shadowIndex, shadowSamples);
+
+            // Uniform over the disc: the square root is what keeps samples from crowding
+            // towards the centre and biasing the penumbra inwards.
+            float radius = angularRadius * sqrt(xi.x);
+            float phi = (xi.y * PROMETHEUS_TWO_PI) + rotation;
+
+            // Small-angle offset in the plane perpendicular to the light, then renormalised.
+            // For half a degree the error against a true spherical sample is negligible.
+            float3 sampleDirection = normalize(
+                lightDirection +
+                (lightTangent * (radius * cos(phi))) +
+                (lightBitangent * (radius * sin(phi))));
+
+            if (!PrometheusTraceShadowRay(
+                    rayOrigin, sampleDirection, _PrometheusRayParams.x, _PrometheusRayParams.y))
+            {
+                unoccluded += 1.0;
+            }
+        }
+
+        visibility = unoccluded / (float)shadowSamples;
+    }
+
+    bool occluded = visibility < 0.5;
+
+    // The exact ray this thread traced, and what it concluded. The host re-traces this same
+    // origin and direction on the CPU: if the two disagree the divergence is inside the
+    // compiled shader, and if they agree the trace is right and the fault is in what happens
+    // to the result afterwards.
+    if (all(pixel == (uint2)(_PrometheusTargetSize.xy * float2(0.5, 0.25))))
+    {
+        _PrometheusDebugProbe[2] = float4(rayOrigin, occluded ? 1.0 : 0.0);
+        _PrometheusDebugProbe[3] = float4(lightDirection, dot(normal, lightDirection));
+    }
+
+    _RawRayVisibilityMap[pixel] = visibility;
+}
+
+// =====================================================================================
+//  Kernel 2: ray-traced ambient occlusion
+//
+//  The shadow kernel answers one question along one direction: can this point see the sun.
+//  That is a lighting term, and it says nothing about how enclosed a point is, which is why
+//  a scene with the fill lights removed goes flat black in shadow rather than showing shape.
+//
+//  This kernel asks the complementary question over the whole hemisphere: what fraction of
+//  nearby directions are blocked. Multiplying ambient by the answer reintroduces the contact
+//  darkening and corner shading that a constant ambient term cannot express.
+//
+//  It reuses the acceleration structure and PrometheusTraceShadowRay unchanged. The only
+//  differences are the ray directions and a short far clip, so a ray that escapes the local
+//  neighbourhood terminates almost immediately.
+// =====================================================================================
+
+[numthreads(PROMETHEUS_THREAD_GROUP_SIZE, PROMETHEUS_THREAD_GROUP_SIZE, 1)]
+void CS_GenerateAmbientOcclusion(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint2 pixel = dispatchThreadId.xy;
+
+    if (pixel.x >= (uint)_PrometheusTargetSize.x || pixel.y >= (uint)_PrometheusTargetSize.y)
+    {
+        return;
+    }
+
+    // Unoccluded is the safe default: it leaves ambient untouched wherever this kernel cannot
+    // form an opinion, rather than darkening on missing data.
+    float2 uv = (pixel + 0.5) * _PrometheusTargetSize.zw;
+
+    int2 depthPixel = int2(uv * _PrometheusDepthTargetSize.xy);
+    depthPixel = clamp(depthPixel, int2(0, 0), int2(_PrometheusDepthTargetSize.xy) - 1);
+
+    float rawDepth = _PrometheusDepthTexture.Load(int3(depthPixel, 0)).r;
+    bool reversedZ = _PrometheusRayParams.w > 0.5;
+
+    if (PrometheusIsSkyDepth(rawDepth, reversedZ) || _PrometheusTlasNodeCount == 0u)
+    {
+        _PrometheusAmbientOcclusionMap[pixel] = 1.0;
+        return;
+    }
+
+    if (_PrometheusFeatureFlags.x < 0.5)
+    {
+        // Occlusion is defined against a surface normal; without one there is no hemisphere
+        // to sample and any answer would be invented.
+        _PrometheusAmbientOcclusionMap[pixel] = 1.0;
+        return;
+    }
+
+    float3 decoded = PrometheusDecodeSceneNormal(
+        _PrometheusNormalTexture.Load(int3(depthPixel, 0)), _PrometheusFeatureFlags.y);
+
+    float normalLengthSquared = dot(decoded, decoded);
+
+    if (normalLengthSquared < 1e-6)
+    {
+        _PrometheusAmbientOcclusionMap[pixel] = 1.0;
+        return;
+    }
+
+    float3 normal = decoded * rsqrt(normalLengthSquared);
+    float3 worldPosition = PrometheusReconstructWorldPosition(uv, rawDepth);
+    float viewDistance = length(worldPosition - _PrometheusCameraPosition.xyz);
+
+    // The hemisphere is centred on the normal, so N.L is one by construction and the grazing
+    // term the shadow path needs does not apply here.
+    float3 origin = PrometheusOffsetRayOrigin(
+        worldPosition, normal, _PrometheusRayParams.z, viewDistance, 1.0);
+
+    float3 tangent;
+    float3 bitangent;
+    PrometheusBuildBasis(normal, tangent, bitangent);
+
+    float radius = max(_PrometheusAoParams.x, 1e-3);
+    uint sampleCount = (uint)max(_PrometheusAoParams.y, 1.0);
+    float rotation = PrometheusInterleavedGradientNoise(pixel, 0.0) * PROMETHEUS_TWO_PI;
+
+    float occluded = 0.0;
+
+    [loop]
+    for (uint index = 0u; index < sampleCount; index++)
+    {
+        float2 xi = PrometheusHammersley(index, sampleCount);
+
+        // Rotating the whole set per pixel turns the structured banding a shared sequence
+        // would produce into high-frequency noise, which reads far better and filters better.
+        float phi = (xi.y * PROMETHEUS_TWO_PI) + rotation;
+
+        // Cosine-weighted: the projected-area term the diffuse integral needs is carried by
+        // the distribution itself, so the estimate is the plain fraction of blocked rays and
+        // needs no per-sample weight.
+        float cosTheta = sqrt(1.0 - xi.x);
+        float sinTheta = sqrt(xi.x);
+
+        float3 direction =
+            (tangent * (sinTheta * cos(phi))) +
+            (bitangent * (sinTheta * sin(phi))) +
+            (normal * cosTheta);
+
+        if (PrometheusTraceShadowRay(origin, direction, _PrometheusRayParams.x, radius))
+        {
+            occluded += 1.0;
+        }
+    }
+
+    float openness = 1.0 - (occluded / (float)sampleCount);
+
+    // Intensity scales how far the term is allowed to close, so a value of zero leaves
+    // ambient untouched and one lets a fully enclosed point reach black.
+    _PrometheusAmbientOcclusionMap[pixel] = saturate(lerp(1.0, openness, _PrometheusAoParams.z));
+}
+
+
+// =====================================================================================
+//  Kernel 3: one-bounce indirect diffuse
+//
+//  Direct light is sun -> surface -> eye, and the shadow kernel answers the visibility in
+//  the middle of it. This kernel computes sun -> surface A -> surface B -> eye: the light
+//  that reaches a point only after scattering off something else.
+//
+//  That is the term nothing else here can approximate. A constant ambient cannot know that
+//  shadowed floor beside a brightly lit wall should be warmer and brighter than shadowed
+//  floor in a far corner, because the difference is entirely a function of what geometry is
+//  nearby and how much light is falling on it. Occlusion can darken a constant; it cannot
+//  give it colour or direction.
+//
+//  Per sample: a cosine-weighted ray into the hemisphere finds the nearest surface, that
+//  surface's own sun visibility is tested with a second ray, and if it is lit its albedo
+//  times the incident sunlight is gathered. Averaging over the samples estimates the
+//  irradiance arriving at the receiver, and multiplying by the receiver's own albedo gives
+//  the radiance it then emits towards the eye.
+//
+//  Cosine weighting matters twice over: it carries the projected-area term of the diffuse
+//  integral, so the estimate is a plain average with no per-sample weight, and it puts
+//  samples where the integrand is largest.
+// =====================================================================================
+
+/// Direct light arriving at a point from every additional light, shadowed.
+///
+/// The counterpart to the main light's next-event estimation, run over the light list. The
+/// main light is deliberately absent from that list and handled by the caller, because it is
+/// the only one with a soft disc and its own uniforms.
+///
+/// Each light costs at most one shadow ray, and often none: a light facing away from the
+/// surface, or beyond its range, is rejected arithmetically before any traversal happens.
+/// That ordering matters, because the traversal is thousands of times the cost of the test
+/// that avoids it.
+float3 PrometheusGatherAdditionalLights(float3 position, float3 normal, float viewDistance)
+{
+    float3 total = float3(0.0, 0.0, 0.0);
+
+    [loop]
+    for (uint lightIndex = 0u; lightIndex < _PrometheusLightCount; lightIndex++)
+    {
+        PrometheusLight light = _PrometheusLights[lightIndex];
+
+        float3 direction;
+        float3 radiance;
+        float rayLength;
+
+        if (!PrometheusEvaluateLight(light, position, normal, direction, radiance, rayLength))
+        {
+            continue;
+        }
+
+        float3 shadowOrigin = PrometheusOffsetRayOrigin(
+            position, normal, _PrometheusRayParams.z, viewDistance, max(dot(normal, direction), 1e-3));
+
+        // Clipped at the light rather than at the scene's far plane. Geometry behind a lamp
+        // cannot shadow it, and stopping there also avoids paying for the traversal.
+        if (PrometheusTraceShadowRay(shadowOrigin, direction, _PrometheusRayParams.x, rayLength))
+        {
+            continue;
+        }
+
+        total += radiance;
+    }
+
+    return total;
+}
+
+/// World-space geometric normal of a triangle belonging to an instance.
+float3 PrometheusHitNormal(PrometheusInstance instance, PrometheusTriangle tri)
+{
+    float3 localNormal = PrometheusGetTriangleNormal(tri);
+    float3 worldNormal = PrometheusTransformNormalToWorld(instance, localNormal);
+
+    float lengthSquared = dot(worldNormal, worldNormal);
+
+    return lengthSquared > 1e-12 ? worldNormal * rsqrt(lengthSquared) : float3(0.0, 1.0, 0.0);
+}
+
+[numthreads(PROMETHEUS_THREAD_GROUP_SIZE, PROMETHEUS_THREAD_GROUP_SIZE, 1)]
+void CS_GenerateIndirectDiffuse(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint2 pixel = dispatchThreadId.xy;
+
+    if (pixel.x >= (uint)_PrometheusTargetSize.x || pixel.y >= (uint)_PrometheusTargetSize.y)
+    {
+        return;
+    }
+
+    float2 uv = (pixel + 0.5) * _PrometheusTargetSize.zw;
+
+    int2 depthPixel = int2(uv * _PrometheusDepthTargetSize.xy);
+    depthPixel = clamp(depthPixel, int2(0, 0), int2(_PrometheusDepthTargetSize.xy) - 1);
+
+    float rawDepth = _PrometheusDepthTexture.Load(int3(depthPixel, 0)).r;
+    bool reversedZ = _PrometheusRayParams.w > 0.5;
+
+    // Black is the correct absence here, unlike the occlusion kernel: this term is added to
+    // the frame rather than multiplied into it, so contributing nothing is the safe default.
+    if (PrometheusIsSkyDepth(rawDepth, reversedZ) ||
+        _PrometheusTlasNodeCount == 0u ||
+        _PrometheusFeatureFlags.x < 0.5)
+    {
+        _PrometheusIndirectMap[pixel] = float4(0.0, 0.0, 0.0, 0.0);
+        return;
+    }
+
+    float3 decoded = PrometheusDecodeSceneNormal(
+        _PrometheusNormalTexture.Load(int3(depthPixel, 0)), _PrometheusFeatureFlags.y);
+
+    float normalLengthSquared = dot(decoded, decoded);
+
+    if (normalLengthSquared < 1e-6)
+    {
+        _PrometheusIndirectMap[pixel] = float4(0.0, 0.0, 0.0, 0.0);
+        return;
+    }
+
+    float3 normal = decoded * rsqrt(normalLengthSquared);
+    float3 worldPosition = PrometheusReconstructWorldPosition(uv, rawDepth);
+    float viewDistance = length(worldPosition - _PrometheusCameraPosition.xyz);
+
+    float3 origin = PrometheusOffsetRayOrigin(
+        worldPosition, normal, _PrometheusRayParams.z, viewDistance, 1.0);
+
+    // The receiver's own albedo tints what it re-emits, and forward rendering hands us no
+    // albedo buffer to read it from, so it has to be recovered by asking the geometry.
+    //
+    // The obvious way is to trace from the camera, but the surface is already known: the depth
+    // buffer gave its exact position. Starting a hand's breadth in front of it and looking back
+    // along the view ray hits the same triangle after a traversal that terminates almost
+    // immediately, instead of descending the whole hierarchy from the camera. Identical answer,
+    // a fraction of the work, and it is the single most expensive ray this kernel used to cast.
+    float3 viewDirection = normalize(worldPosition - _PrometheusCameraPosition.xyz);
+
+    const float kAlbedoProbeOffset = 0.05;
+
+    PrometheusHit primary = PrometheusTraceClosestHit(
+        worldPosition - (viewDirection * kAlbedoProbeOffset),
+        viewDirection,
+        0.0,
+        kAlbedoProbeOffset * 4.0);
+
+    float3 receiverAlbedo = primary.isHit
+        ? _PrometheusInstanceAlbedo[primary.instanceIndex].rgb
+        : float3(0.5, 0.5, 0.5);
+
+    float3 tangent;
+    float3 bitangent;
+    PrometheusBuildBasis(normal, tangent, bitangent);
+
+    uint sampleCount = (uint)max(_PrometheusIndirectParams.x, 1.0);
+    float maxDistance = max(_PrometheusIndirectParams.z, 1e-3);
+
+    // Fixed in place, not advanced per frame like the shadow sequence. Indirect is resolved
+    // by the spatial filter rather than by accumulation over time, and a filter works on a
+    // stationary pattern of grain; one that moved every frame would shimmer instead.
+    float rotation = PrometheusInterleavedGradientNoise(pixel, 0.0) * PROMETHEUS_TWO_PI;
+
+    float3 lightDirection = normalize(_PrometheusLightDirection.xyz);
+    uint maxBounces = (uint)max(_PrometheusIndirectParams.w, 1.0);
+
+    float3 gathered = float3(0.0, 0.0, 0.0);
+
+    [loop]
+    for (uint index = 0u; index < sampleCount; index++)
+    {
+        // Each sample walks a path away from the surface, gathering the sunlight it finds at
+        // every point it lands on. One segment is the light that reaches this pixel after
+        // scattering once; two is light that scattered twice, which is how a room without a
+        // direct view of the sun is lit at all.
+        //
+        // Throughput is the fraction of energy still travelling after the surfaces already
+        // passed through. Cosine-weighted sampling makes it a plain product of albedos: the
+        // cosine and the probability density cancel exactly, so no other factor appears.
+        float3 throughput = float3(1.0, 1.0, 1.0);
+
+        float3 pathOrigin = origin;
+        float3 pathNormal = normal;
+        float3 pathTangent = tangent;
+        float3 pathBitangent = bitangent;
+
+        [loop]
+        for (uint bounce = 0u; bounce < maxBounces; bounce++)
+        {
+            // The first segment uses the low-discrepancy set, which spreads the primary
+            // directions evenly and matters most. Later segments hash instead: those paths
+            // have already diverged, so stratifying them together buys nothing.
+            float2 xi = bounce == 0u
+                ? PrometheusHammersley(index, sampleCount)
+                : PrometheusHash2((index * 9781u) + (bounce * 6151u) + (pixel.x * 73u) + (pixel.y * 179u));
+
+            float bounceRotation = bounce == 0u ? rotation : 0.0;
+
+            float3 direction = PrometheusCosineDirection(
+                xi, bounceRotation, pathNormal, pathTangent, pathBitangent);
+
+            PrometheusHit hit = PrometheusTraceClosestHit(
+                pathOrigin, direction, _PrometheusRayParams.x, maxDistance);
+
+            if (!hit.isHit)
+            {
+                // The path left the scene. Adding sky radiance here would double count
+                // whatever ambient the host already applies.
+                break;
+            }
+
+            PrometheusInstance hitInstance = _PrometheusInstances[hit.instanceIndex];
+            PrometheusTriangle hitTriangle = _PrometheusTriangles[hit.triangleIndex];
+
+            float3 hitNormal = PrometheusHitNormal(hitInstance, hitTriangle);
+
+            // The stored normal faces out of the surface; a ray arriving from the far side
+            // must shade against the face it actually struck.
+            hitNormal = dot(hitNormal, direction) > 0.0 ? -hitNormal : hitNormal;
+
+            // Emission is added before the surface's albedo is folded in, and that order is
+            // not cosmetic. Light leaving a glowing surface is not light the surface
+            // reflected: a red tube emits red however dark its own material is. Multiplying
+            // first would tint every emitter by its own paint.
+            //
+            // No shadow ray is needed or wanted here. The ray already arrived, which is proof
+            // the surface is visible from the path; asking again would be asking whether a
+            // light can see itself.
+            gathered += throughput * _PrometheusInstanceEmission[hit.instanceIndex].rgb;
+
+            throughput *= _PrometheusInstanceAlbedo[hit.instanceIndex].rgb;
+
+            float3 hitPosition = pathOrigin + (direction * hit.distance);
+            float hitNdotL = dot(hitNormal, lightDirection);
+
+            float3 bounceOrigin = PrometheusOffsetRayOrigin(
+                hitPosition, hitNormal, _PrometheusRayParams.z, viewDistance, max(hitNdotL, 1e-3));
+
+            // Next event estimation: rather than hoping a later segment stumbles onto the sun,
+            // every landing point is connected to it directly. Without this a path would only
+            // find light by chance and the estimate would be far noisier for the same cost.
+            if (hitNdotL > 0.0 &&
+                !PrometheusTraceShadowRay(
+                    bounceOrigin, lightDirection, _PrometheusRayParams.x, _PrometheusRayParams.y))
+            {
+                gathered += throughput * _PrometheusLightColor.rgb * hitNdotL;
+            }
+
+            // Lamps scatter exactly as the sun does. Without this a red light in a corner
+            // throws no red onto the wall beside it, because the path only ever asked about
+            // one light and every other one may as well not exist.
+            gathered += throughput *
+                PrometheusGatherAdditionalLights(hitPosition, hitNormal, viewDistance);
+
+            // A path that has lost nearly all its energy cannot contribute anything visible,
+            // and continuing it costs exactly as much as a path that could.
+            if (max(throughput.r, max(throughput.g, throughput.b)) < 0.01)
+            {
+                break;
+            }
+
+            pathOrigin = bounceOrigin;
+            pathNormal = hitNormal;
+            PrometheusBuildBasis(pathNormal, pathTangent, pathBitangent);
+        }
+    }
+
+    float3 irradiance = gathered / (float)sampleCount;
+    float3 radiance = irradiance * receiverAlbedo * _PrometheusIndirectParams.y;
+
+    _PrometheusIndirectMap[pixel] = float4(radiance, 1.0);
+}
+
+
+// =====================================================================================
+//  Kernel 4: edge-aware blur for the indirect buffer
+//
+//  Hemisphere sampling is a Monte Carlo estimate, so a handful of rays per pixel leaves
+//  grain that no amount of care in the sampling pattern removes: it is variance, and the
+//  only cures are more samples or averaging neighbours.
+//
+//  Averaging neighbours is enormously cheaper here than tracing more rays, and indirect
+//  light is the one signal that tolerates it. It varies slowly across a surface by nature,
+//  so a wide blur discards almost nothing real. The same blur applied to a shadow edge
+//  would destroy it, which is why this filter exists separately from the visibility chain
+//  rather than being shared with it.
+//
+//  What must not be crossed is a geometric boundary. Depth and normal weights stop the
+//  filter at silhouettes and creases, so bounce light gathered on the floor never leaks
+//  onto the wall behind it.
+// =====================================================================================
+
+[numthreads(PROMETHEUS_THREAD_GROUP_SIZE, PROMETHEUS_THREAD_GROUP_SIZE, 1)]
+void CS_FilterIndirect(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint2 pixel = dispatchThreadId.xy;
+
+    if (pixel.x >= (uint)_PrometheusTargetSize.x || pixel.y >= (uint)_PrometheusTargetSize.y)
+    {
+        return;
+    }
+
+    int2 bounds = int2(_PrometheusTargetSize.xy) - 1;
+    int stepSize = max(1, (int)_PrometheusFilterParams.x);
+
+    float2 uv = (pixel + 0.5) * _PrometheusTargetSize.zw;
+
+    int2 centreDepthPixel = int2(uv * _PrometheusDepthTargetSize.xy);
+    centreDepthPixel = clamp(centreDepthPixel, int2(0, 0), int2(_PrometheusDepthTargetSize.xy) - 1);
+
+    float centreRawDepth = _PrometheusDepthTexture.Load(int3(centreDepthPixel, 0)).r;
+    bool reversedZ = _PrometheusRayParams.w > 0.5;
+
+    if (PrometheusIsSkyDepth(centreRawDepth, reversedZ))
+    {
+        _PrometheusIndirectMap[pixel] = float4(0.0, 0.0, 0.0, 0.0);
+        return;
+    }
+
+    float3 centrePosition = PrometheusReconstructWorldPosition(uv, centreRawDepth);
+    float3 centreNormal = PrometheusDecodeSceneNormal(
+        _PrometheusNormalTexture.Load(int3(centreDepthPixel, 0)), _PrometheusFeatureFlags.y);
+
+    float centreNormalLengthSquared = dot(centreNormal, centreNormal);
+    centreNormal = centreNormalLengthSquared > 1e-6
+        ? centreNormal * rsqrt(centreNormalLengthSquared)
+        : float3(0.0, 1.0, 0.0);
+
+    float3 sum = float3(0.0, 0.0, 0.0);
+    float weightSum = 0.0;
+
+    [unroll]
+    for (int oy = -2; oy <= 2; oy++)
+    {
+        [unroll]
+        for (int ox = -2; ox <= 2; ox++)
+        {
+            int2 tap = clamp(int2(pixel) + (int2(ox, oy) * stepSize), int2(0, 0), bounds);
+
+            float2 tapUv = (tap + 0.5) * _PrometheusTargetSize.zw;
+
+            int2 tapDepthPixel = int2(tapUv * _PrometheusDepthTargetSize.xy);
+            tapDepthPixel = clamp(tapDepthPixel, int2(0, 0), int2(_PrometheusDepthTargetSize.xy) - 1);
+
+            float tapRawDepth = _PrometheusDepthTexture.Load(int3(tapDepthPixel, 0)).r;
+
+            if (PrometheusIsSkyDepth(tapRawDepth, reversedZ))
+            {
+                continue;
+            }
+
+            float3 tapPosition = PrometheusReconstructWorldPosition(tapUv, tapRawDepth);
+            float3 tapNormal = PrometheusDecodeSceneNormal(
+                _PrometheusNormalTexture.Load(int3(tapDepthPixel, 0)), _PrometheusFeatureFlags.y);
+
+            float tapNormalLengthSquared = dot(tapNormal, tapNormal);
+            tapNormal = tapNormalLengthSquared > 1e-6
+                ? tapNormal * rsqrt(tapNormalLengthSquared)
+                : float3(0.0, 1.0, 0.0);
+
+            // Distance from the centre pixel's tangent plane, not from the centre point. A
+            // surface receding from the viewer is one plane and should filter freely along
+            // itself; only a genuine step out of that plane is an edge.
+            float planeDistance = abs(dot(tapPosition - centrePosition, centreNormal));
+            float depthWeight = exp(-planeDistance / (_PrometheusFilterParams.y + 1e-4));
+
+            float normalWeight = pow(saturate(dot(centreNormal, tapNormal)), _PrometheusFilterParams.z);
+
+            float weight = depthWeight * normalWeight;
+
+            sum += _PrometheusIndirectSource.Load(int3(tap, 0)).rgb * weight;
+            weightSum += weight;
+        }
+    }
+
+    // A centre pixel whose every neighbour was rejected keeps its own value rather than going
+    // black, which is what dividing by a zero weight would produce.
+    float3 filtered = weightSum > 1e-5
+        ? sum / weightSum
+        : _PrometheusIndirectSource.Load(int3(pixel, 0)).rgb;
+
+    _PrometheusIndirectMap[pixel] = float4(filtered, 1.0);
+}
+
+
+// =====================================================================================
+//  Kernel 5: specular reflections
+//
+//  This is the effect ray tracing is usually recognised by, and the one screen-space
+//  techniques cannot fake. Screen-space reflection can only reflect what is already on
+//  screen, so it fails exactly where reflections matter most: the underside of an object
+//  resting on a floor, anything behind the camera, anything just outside the frame. Those
+//  are not artefacts to be tuned away, they are the method's definition. Tracing the ray
+//  into the acceleration structure has no such horizon.
+//
+//  The shading at the hit is deliberately the same next-event estimation the bounce uses:
+//  find the surface, ask whether the sun reaches it, take its albedo. A reflection of a
+//  shadowed wall is dark for the same reason the wall is.
+// =====================================================================================
+
+/// Reflection strength for a dielectric or metal at a given viewing angle.
+///
+/// Schlick's approximation. The angular dependence is the whole reason a nearly matte floor
+/// still mirrors the room when seen edge-on: reflectance climbs towards one at grazing
+/// incidence regardless of the material, which is why wet roads and polished stone read the
+/// way they do. A constant reflectivity misses that entirely.
+float3 PrometheusFresnel(float3 albedo, float metallic, float cosTheta)
+{
+    // Non-metals reflect about four percent head-on whatever they are made of; metals
+    // reflect their own colour, which is why gold tints what it mirrors.
+    float3 f0 = lerp(float3(0.04, 0.04, 0.04), albedo, metallic);
+    float weight = pow(saturate(1.0 - cosTheta), 5.0);
+
+    return f0 + ((1.0 - f0) * weight);
+}
+
+[numthreads(PROMETHEUS_THREAD_GROUP_SIZE, PROMETHEUS_THREAD_GROUP_SIZE, 1)]
+void CS_GenerateReflections(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint2 pixel = dispatchThreadId.xy;
+
+    if (pixel.x >= (uint)_PrometheusTargetSize.x || pixel.y >= (uint)_PrometheusTargetSize.y)
+    {
+        return;
+    }
+
+    float2 uv = (pixel + 0.5) * _PrometheusTargetSize.zw;
+
+    int2 depthPixel = int2(uv * _PrometheusDepthTargetSize.xy);
+    depthPixel = clamp(depthPixel, int2(0, 0), int2(_PrometheusDepthTargetSize.xy) - 1);
+
+    float rawDepth = _PrometheusDepthTexture.Load(int3(depthPixel, 0)).r;
+    bool reversedZ = _PrometheusRayParams.w > 0.5;
+
+    if (PrometheusIsSkyDepth(rawDepth, reversedZ) ||
+        _PrometheusTlasNodeCount == 0u ||
+        _PrometheusFeatureFlags.x < 0.5)
+    {
+        _PrometheusReflectionMap[pixel] = float4(0.0, 0.0, 0.0, 0.0);
+        return;
+    }
+
+    float3 decoded = PrometheusDecodeSceneNormal(
+        _PrometheusNormalTexture.Load(int3(depthPixel, 0)), _PrometheusFeatureFlags.y);
+
+    float normalLengthSquared = dot(decoded, decoded);
+
+    if (normalLengthSquared < 1e-6)
+    {
+        _PrometheusReflectionMap[pixel] = float4(0.0, 0.0, 0.0, 0.0);
+        return;
+    }
+
+    float3 normal = decoded * rsqrt(normalLengthSquared);
+    float3 worldPosition = PrometheusReconstructWorldPosition(uv, rawDepth);
+    float viewDistance = length(worldPosition - _PrometheusCameraPosition.xyz);
+    float3 viewDirection = normalize(worldPosition - _PrometheusCameraPosition.xyz);
+
+    // Which surface is being shaded, and therefore how it responds. Same short backwards
+    // probe the indirect kernel uses: the position is already known from depth, so there is
+    // no reason to walk the hierarchy from the camera to rediscover it.
+    const float kSurfaceProbeOffset = 0.05;
+
+    PrometheusHit surface = PrometheusTraceClosestHit(
+        worldPosition - (viewDirection * kSurfaceProbeOffset),
+        viewDirection,
+        0.0,
+        kSurfaceProbeOffset * 4.0);
+
+    if (!surface.isHit)
+    {
+        _PrometheusReflectionMap[pixel] = float4(0.0, 0.0, 0.0, 0.0);
+        return;
+    }
+
+    float3 surfaceAlbedo = _PrometheusInstanceAlbedo[surface.instanceIndex].rgb;
+    float2 surfaceMaterial = _PrometheusInstanceMaterial[surface.instanceIndex].xy;
+
+    float metallic = surfaceMaterial.x;
+    float smoothness = surfaceMaterial.y;
+    float roughness = 1.0 - smoothness;
+
+    // A fully rough dielectric scatters its reflection into the hemisphere, where it is
+    // indistinguishable from the diffuse bounce the indirect pass already computes. Tracing
+    // it again here would double count it, and cost a great deal to do so.
+    if (roughness > 0.95 && metallic < 0.05)
+    {
+        _PrometheusReflectionMap[pixel] = float4(0.0, 0.0, 0.0, 0.0);
+        return;
+    }
+
+    float3 origin = PrometheusOffsetRayOrigin(
+        worldPosition, normal, _PrometheusRayParams.z, viewDistance, 1.0);
+
+    float3 mirrorDirection = reflect(viewDirection, normal);
+
+    float3 mirrorTangent;
+    float3 mirrorBitangent;
+    PrometheusBuildBasis(mirrorDirection, mirrorTangent, mirrorBitangent);
+
+    uint sampleCount = (uint)max(_PrometheusReflectionParams.x, 1.0);
+    float maxDistance = max(_PrometheusReflectionParams.z, 1e-3);
+
+    float rotation =
+        PrometheusInterleavedGradientNoise(pixel, _PrometheusShadowParams.z) * PROMETHEUS_TWO_PI;
+
+    float3 lightDirection = normalize(_PrometheusLightDirection.xyz);
+
+    // Roughness widens the cone the reflection is gathered over. Squaring it makes the slider
+    // behave the way a material author expects, since perceptual smoothness is far from
+    // linear in the width of the lobe it produces.
+    float coneRadius = roughness * roughness;
+
+    float3 gathered = float3(0.0, 0.0, 0.0);
+    float hitDistanceSum = 0.0;
+    float hitCount = 0.0;
+
+    [loop]
+    for (uint index = 0u; index < sampleCount; index++)
+    {
+        float3 direction = mirrorDirection;
+
+        if (coneRadius > 1e-4)
+        {
+            float2 xi = PrometheusHammersley(index, sampleCount);
+
+            float radius = coneRadius * sqrt(xi.x);
+            float phi = (xi.y * PROMETHEUS_TWO_PI) + rotation;
+
+            direction = normalize(
+                mirrorDirection +
+                (mirrorTangent * (radius * cos(phi))) +
+                (mirrorBitangent * (radius * sin(phi))));
+        }
+
+        // A jittered direction can end up below the surface it left, which would trace back
+        // into the object and return whatever is inside it.
+        if (dot(direction, normal) <= 0.0)
+        {
+            continue;
+        }
+
+        PrometheusHit hit = PrometheusTraceClosestHit(
+            origin, direction, _PrometheusRayParams.x, maxDistance);
+
+        if (!hit.isHit)
+        {
+            continue;
+        }
+
+        PrometheusInstance hitInstance = _PrometheusInstances[hit.instanceIndex];
+        PrometheusTriangle hitTriangle = _PrometheusTriangles[hit.triangleIndex];
+
+        float3 hitNormal = PrometheusHitNormal(hitInstance, hitTriangle);
+        hitNormal = dot(hitNormal, direction) > 0.0 ? -hitNormal : hitNormal;
+
+        float3 hitPosition = origin + (direction * hit.distance);
+        float hitNdotL = dot(hitNormal, lightDirection);
+
+        // Facing away from the sun no longer means unlit: a lamp may still reach it. The test
+        // now guards only the sun's own contribution instead of discarding the whole hit.
+        float sunVisible = 0.0;
+
+        if (hitNdotL > 0.0)
+        {
+            float3 shadowOrigin = PrometheusOffsetRayOrigin(
+                hitPosition, hitNormal, _PrometheusRayParams.z, viewDistance, hitNdotL);
+
+            sunVisible = PrometheusTraceShadowRay(
+                shadowOrigin, lightDirection, _PrometheusRayParams.x, _PrometheusRayParams.y)
+                ? 0.0 : 1.0;
+        }
+
+        hitNdotL = max(hitNdotL, 0.0) * sunVisible;
+
+        float3 hitAlbedo = _PrometheusInstanceAlbedo[hit.instanceIndex].rgb;
+
+        // Unmodulated by albedo, and unaffected by whether the sun reaches it: a sign glows
+        // in a mirror at night exactly as it glows in daylight.
+        gathered += _PrometheusInstanceEmission[hit.instanceIndex].rgb;
+
+        gathered += hitAlbedo * _PrometheusLightColor.rgb * hitNdotL;
+        gathered += hitAlbedo *
+            PrometheusGatherAdditionalLights(hitPosition, hitNormal, viewDistance);
+
+        hitDistanceSum += hit.distance;
+        hitCount += 1.0;
+    }
+
+    float3 reflected = gathered / (float)sampleCount;
+
+    float cosTheta = saturate(dot(normal, -viewDirection));
+    float3 fresnel = PrometheusFresnel(surfaceAlbedo, metallic, cosTheta);
+
+    // How wide this pixel's reflection should be spread, written for the filter to read.
+    //
+    // A rough surface reflects into a cone of fixed angular width, so the patch of the world
+    // that cone covers grows in proportion to how far the ray travelled. What reaches the eye
+    // is that patch seen from the reflecting surface, which is why a slightly rough floor
+    // mirrors your feet almost sharply and the far wall as a smear. The ratio of the two
+    // distances is exactly that angular size.
+    //
+    // Deriving it here rather than in the filter is deliberate: this is the only place the
+    // hit distance exists, and recovering it later would mean tracing the ray twice.
+    float averageHitDistance = hitCount > 0.0 ? hitDistanceSum / hitCount : 0.0;
+    float spread = coneRadius * averageHitDistance / max(viewDistance, 1e-3);
+
+    _PrometheusReflectionMap[pixel] = float4(
+        reflected * fresnel * _PrometheusReflectionParams.y,
+        saturate(spread));
+}
+
+
+// =====================================================================================
+//  Kernel 6: distance-aware reflection blur
+//
+//  A mirror reflects a distant wall exactly as sharply as a near one, and that is correct:
+//  a perfectly smooth surface has no lobe to spread. Roughness is what introduces one, and
+//  the patch of the world it gathers from grows with the distance the ray travelled. Real
+//  rough reflections are therefore sharp close to the contact point and soften with depth,
+//  which is the single strongest cue that a reflection belongs to a surface rather than
+//  being painted on it.
+//
+//  The trace already knows that spread and wrote it into alpha. Reproducing it by tracing
+//  more rays would work and would cost a multiple of the whole pass; blurring by the radius
+//  it already computed costs a handful of texture reads.
+//
+//  Depth and normal weights keep it from dragging a reflection across a silhouette, which
+//  would look far worse than the noise it is removing.
+// =====================================================================================
+
+[numthreads(PROMETHEUS_THREAD_GROUP_SIZE, PROMETHEUS_THREAD_GROUP_SIZE, 1)]
+void CS_FilterReflections(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint2 pixel = dispatchThreadId.xy;
+
+    if (pixel.x >= (uint)_PrometheusTargetSize.x || pixel.y >= (uint)_PrometheusTargetSize.y)
+    {
+        return;
+    }
+
+    float4 centre = _PrometheusReflectionSource.Load(int3(pixel, 0));
+
+    // Alpha carries the spread the trace computed. A mirror reports zero and is passed
+    // through untouched, which is both correct and the cheapest possible path.
+    float radius = centre.a * max(_PrometheusReflectionParams.w, 0.0);
+
+    if (radius < 0.5)
+    {
+        _PrometheusReflectionMap[pixel] = centre;
+        return;
+    }
+
+    int2 bounds = int2(_PrometheusTargetSize.xy) - 1;
+    int step = max(1, (int)round(radius * 0.5));
+
+    float2 uv = (pixel + 0.5) * _PrometheusTargetSize.zw;
+
+    int2 centreDepthPixel = int2(uv * _PrometheusDepthTargetSize.xy);
+    centreDepthPixel = clamp(centreDepthPixel, int2(0, 0), int2(_PrometheusDepthTargetSize.xy) - 1);
+
+    float centreRawDepth = _PrometheusDepthTexture.Load(int3(centreDepthPixel, 0)).r;
+    bool reversedZ = _PrometheusRayParams.w > 0.5;
+
+    if (PrometheusIsSkyDepth(centreRawDepth, reversedZ))
+    {
+        _PrometheusReflectionMap[pixel] = centre;
+        return;
+    }
+
+    float3 centrePosition = PrometheusReconstructWorldPosition(uv, centreRawDepth);
+    float3 centreNormal = PrometheusDecodeSceneNormal(
+        _PrometheusNormalTexture.Load(int3(centreDepthPixel, 0)), _PrometheusFeatureFlags.y);
+
+    float centreNormalLengthSquared = dot(centreNormal, centreNormal);
+    centreNormal = centreNormalLengthSquared > 1e-6
+        ? centreNormal * rsqrt(centreNormalLengthSquared)
+        : float3(0.0, 1.0, 0.0);
+
+    float3 sum = float3(0.0, 0.0, 0.0);
+    float weightSum = 0.0;
+
+    [unroll]
+    for (int oy = -2; oy <= 2; oy++)
+    {
+        [unroll]
+        for (int ox = -2; ox <= 2; ox++)
+        {
+            int2 tap = clamp(int2(pixel) + (int2(ox, oy) * step), int2(0, 0), bounds);
+
+            float2 tapUv = (tap + 0.5) * _PrometheusTargetSize.zw;
+
+            int2 tapDepthPixel = int2(tapUv * _PrometheusDepthTargetSize.xy);
+            tapDepthPixel = clamp(tapDepthPixel, int2(0, 0), int2(_PrometheusDepthTargetSize.xy) - 1);
+
+            float tapRawDepth = _PrometheusDepthTexture.Load(int3(tapDepthPixel, 0)).r;
+
+            if (PrometheusIsSkyDepth(tapRawDepth, reversedZ))
+            {
+                continue;
+            }
+
+            float3 tapPosition = PrometheusReconstructWorldPosition(tapUv, tapRawDepth);
+            float3 tapNormal = PrometheusDecodeSceneNormal(
+                _PrometheusNormalTexture.Load(int3(tapDepthPixel, 0)), _PrometheusFeatureFlags.y);
+
+            float tapNormalLengthSquared = dot(tapNormal, tapNormal);
+            tapNormal = tapNormalLengthSquared > 1e-6
+                ? tapNormal * rsqrt(tapNormalLengthSquared)
+                : float3(0.0, 1.0, 0.0);
+
+            // Distance from the centre pixel's own plane, so a floor receding from the viewer
+            // filters freely along itself and only a real step out of that plane is an edge.
+            float planeDistance = abs(dot(tapPosition - centrePosition, centreNormal));
+            float depthWeight = exp(-planeDistance / 0.1);
+
+            float normalWeight = pow(saturate(dot(centreNormal, tapNormal)), 32.0);
+
+            float weight = depthWeight * normalWeight;
+
+            sum += _PrometheusReflectionSource.Load(int3(tap, 0)).rgb * weight;
+            weightSum += weight;
+        }
+    }
+
+    float3 filtered = weightSum > 1e-5 ? sum / weightSum : centre.rgb;
+
+    _PrometheusReflectionMap[pixel] = float4(filtered, centre.a);
+}
