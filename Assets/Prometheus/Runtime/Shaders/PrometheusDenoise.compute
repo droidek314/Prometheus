@@ -1,0 +1,342 @@
+#pragma kernel CS_TemporalAccumulate
+#pragma kernel CS_AtrousFilter
+#pragma kernel CS_SpatialUpsample
+#pragma target 5.0
+
+#include "Includes/SpatialUpsamplePass.hlsl"
+
+// =====================================================================================
+//  Prometheus Software Ray-Tracing Engine
+//  Denoiser kernels - Phase 6 (ADR-002)
+//
+//  -----------------------------------------------------------------------------------
+//  BUFFER LAYOUT ANNOTATION (Section 4.3 - HLSL Annotation Standard)
+//  -----------------------------------------------------------------------------------
+//
+//   Register | Binding                        | Type               | Resolution | Access
+//   ---------+--------------------------------+--------------------+------------+-------
+//   t0       | _PrometheusRawVisibility       | Texture2D<float>   | 0.5x       | read
+//   t1       | _PrometheusMotionVectors       | Texture2D<float2>  | 1.0x       | read
+//   t2       | _PrometheusSceneDepth          | Texture2D<float>   | 1.0x       | read
+//   t3       | _PrometheusSceneNormals        | Texture2D<float4>  | 1.0x       | read
+//   t4       | _PrometheusHistoryColor        | Texture2D<float4>  | 0.5x       | read
+//   t5       | _PrometheusHistoryGeometry     | Texture2D<float4>  | 0.5x       | read
+//   t6       | _PrometheusFilterInput         | Texture2D<float4>  | 0.5x       | read
+//   u0       | _PrometheusHistoryColorOut     | RWTexture2D<float4>| 0.5x       | write
+//   u1       | _PrometheusHistoryGeometryOut  | RWTexture2D<float4>| 0.5x       | write
+//   u2       | _PrometheusFilterOutput        | RWTexture2D<float4>| 0.5x       | write
+//   u3       | _PrometheusDenoisedVisibility  | RWTexture2D<float> | 1.0x       | write
+//
+//  Colour channels:   (visibility, second moment, history length, variance)
+//  Geometry channels: (normal.xyz, linear eye depth)
+//
+//  The a-trous kernel ping-pongs between two 0.5x targets; the host rebinds t6 and u2
+//  each iteration rather than the shader holding both, which keeps the UAV count inside
+//  the Shader Model 5.0 budget.
+//
+//  DISPATCH: 16x16 thread groups throughout, fixed by Section 3.1. Temporal and a-trous
+//  run at the sub-sampled extent; upsample runs at native.
+// =====================================================================================
+
+#define PROMETHEUS_THREAD_GROUP_SIZE 16
+
+Texture2D<float>  _PrometheusRawVisibility   : register(t0);
+Texture2D<float2> _PrometheusMotionVectors   : register(t1);
+Texture2D<float>  _PrometheusSceneDepth      : register(t2);
+Texture2D<float4> _PrometheusSceneNormals    : register(t3);
+Texture2D<float4> _PrometheusHistoryColor    : register(t4);
+Texture2D<float4> _PrometheusHistoryGeometry : register(t5);
+Texture2D<float4> _PrometheusFilterInput     : register(t6);
+
+RWTexture2D<float4> _PrometheusHistoryColorOut    : register(u0);
+RWTexture2D<float4> _PrometheusHistoryGeometryOut : register(u1);
+RWTexture2D<float4> _PrometheusFilterOutput       : register(u2);
+RWTexture2D<float>  _PrometheusDenoisedVisibility : register(u3);
+
+/// (width, height, 1/width, 1/height) of the sub-sampled denoiser working resolution.
+float4 _PrometheusDenoiseSize;
+
+/// (width, height, 1/width, 1/height) of the native output and G-buffer resolution.
+float4 _PrometheusFullResSize;
+
+/// Unity-style _ZBufferParams, so depth linearisation carries no platform branch.
+float4 _PrometheusZBufferParams;
+
+/// (atrousStepSize, historyResetFlag, clampScale, unused).
+float4 _PrometheusDenoiseParams;
+
+// =====================================================================================
+//  Shared sampling helpers
+// =====================================================================================
+
+/// Full-resolution pixel corresponding to a sub-sampled pixel centre.
+int2 PrometheusCoarseToFullResPixel(uint2 coarsePixel)
+{
+    float2 uv = (coarsePixel + 0.5) * _PrometheusDenoiseSize.zw;
+    int2 pixel = int2(uv * _PrometheusFullResSize.xy);
+    return clamp(pixel, int2(0, 0), int2(_PrometheusFullResSize.xy) - 1);
+}
+
+/// Decodes a G-buffer normal sample into a unit world-space normal.
+///
+/// URP's forward DepthNormals prepass writes the raw world normal into an SNorm target, so
+/// the value already spans [-1, 1] and must not be remapped. A zero sample, which is what an
+/// unbound or cleared target reads as, normalises to NaN and would poison every edge-stopping
+/// weight downstream, so it falls back to a fixed axis instead.
+float3 PrometheusDecodeSceneNormal(float4 encoded)
+{
+    float lengthSquared = dot(encoded.xyz, encoded.xyz);
+
+    return lengthSquared > 1e-6
+        ? encoded.xyz * rsqrt(lengthSquared)
+        : float3(0.0, 1.0, 0.0);
+}
+
+// =====================================================================================
+//  Kernel 1: temporal accumulation
+// =====================================================================================
+
+/// Reprojects last frame's estimate, validates it, clamps it and blends this frame in.
+[numthreads(PROMETHEUS_THREAD_GROUP_SIZE, PROMETHEUS_THREAD_GROUP_SIZE, 1)]
+void CS_TemporalAccumulate(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint2 pixel = dispatchThreadId.xy;
+
+    if (pixel.x >= (uint)_PrometheusDenoiseSize.x || pixel.y >= (uint)_PrometheusDenoiseSize.y)
+    {
+        return;
+    }
+
+    int2 fullResPixel = PrometheusCoarseToFullResPixel(pixel);
+
+    float rawDepth = _PrometheusSceneDepth.Load(int3(fullResPixel, 0)).r;
+    float linearDepth = PrometheusLinearEyeDepth(rawDepth, _PrometheusZBufferParams);
+    float3 normal = PrometheusDecodeSceneNormal(_PrometheusSceneNormals.Load(int3(fullResPixel, 0)));
+
+    float current = _PrometheusRawVisibility.Load(int3(pixel, 0)).r;
+
+    // Local statistics drive both the history clamp and the initial variance estimate.
+    float sum = 0.0;
+    float sumSquared = 0.0;
+    float sampleCount = 0.0;
+
+    [unroll]
+    for (int oy = -1; oy <= 1; oy++)
+    {
+        [unroll]
+        for (int ox = -1; ox <= 1; ox++)
+        {
+            int2 tap = clamp(int2(pixel) + int2(ox, oy), int2(0, 0), int2(_PrometheusDenoiseSize.xy) - 1);
+            float value = _PrometheusRawVisibility.Load(int3(tap, 0)).r;
+            sum += value;
+            sumSquared += value * value;
+            sampleCount += 1.0;
+        }
+    }
+
+    float neighbourhoodMean = sum / sampleCount;
+    float neighbourhoodVariance = max(0.0, (sumSquared / sampleCount) - (neighbourhoodMean * neighbourhoodMean));
+    float neighbourhoodStdDev = sqrt(neighbourhoodVariance);
+
+    float2 uv = (pixel + 0.5) * _PrometheusDenoiseSize.zw;
+    float2 motion = _PrometheusMotionVectors.Load(int3(fullResPixel, 0)).xy;
+    float2 historyUv = uv - motion;
+
+    float historyVisibility = current;
+    float historySecondMoment = current * current;
+    float historyLength = 0.0;
+
+    // EC-002 forces this branch: a teleport invalidates every reprojection at once, so
+    // the host raises the flag rather than relying on per-pixel rejection to catch it.
+    bool historyReset = _PrometheusDenoiseParams.y > 0.5;
+
+    if (!historyReset && PrometheusIsInsideViewport(historyUv))
+    {
+        int2 historyPixel = clamp(
+            int2(historyUv * _PrometheusDenoiseSize.xy),
+            int2(0, 0),
+            int2(_PrometheusDenoiseSize.xy) - 1);
+
+        float4 historyColor = _PrometheusHistoryColor.Load(int3(historyPixel, 0));
+        float4 historyGeometry = _PrometheusHistoryGeometry.Load(int3(historyPixel, 0));
+
+        if (PrometheusIsHistoryValid(linearDepth, historyGeometry.w, normal, historyGeometry.xyz))
+        {
+            float clamped = PrometheusClampHistory(
+                historyColor.x, neighbourhoodMean, neighbourhoodStdDev, _PrometheusDenoiseParams.z);
+
+            historyVisibility = clamped;
+            historySecondMoment = historyColor.y;
+            historyLength = min(historyColor.z, PROMETHEUS_MAX_HISTORY_LENGTH);
+        }
+    }
+
+    float alpha = PrometheusTemporalAlpha(historyLength);
+
+    float accumulated = lerp(historyVisibility, current, alpha);
+    float accumulatedSecondMoment = lerp(historySecondMoment, current * current, alpha);
+    float newHistoryLength = min(historyLength + 1.0, PROMETHEUS_MAX_HISTORY_LENGTH);
+
+    // A short history has no meaningful temporal variance yet, so the spatial estimate
+    // stands in and drives the a-trous weights hard until accumulation catches up.
+    float variance = newHistoryLength < 4.0
+        ? max(neighbourhoodVariance, PrometheusVarianceFromMoments(accumulated, accumulatedSecondMoment))
+        : PrometheusVarianceFromMoments(accumulated, accumulatedSecondMoment);
+
+    _PrometheusHistoryColorOut[pixel] = float4(accumulated, accumulatedSecondMoment, newHistoryLength, variance);
+    _PrometheusHistoryGeometryOut[pixel] = float4(normal, linearDepth);
+}
+
+// =====================================================================================
+//  Kernel 2: a-trous wavelet iteration
+// =====================================================================================
+
+/// One 5x5 edge-stopping wavelet iteration at the step size the host supplies.
+///
+/// Successive iterations double the step, so a handful of passes reach a wide support
+/// while every pass costs the same 25 taps. Section 3.1 bounds the iteration count to
+/// [1, 4].
+[numthreads(PROMETHEUS_THREAD_GROUP_SIZE, PROMETHEUS_THREAD_GROUP_SIZE, 1)]
+void CS_AtrousFilter(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint2 pixel = dispatchThreadId.xy;
+
+    if (pixel.x >= (uint)_PrometheusDenoiseSize.x || pixel.y >= (uint)_PrometheusDenoiseSize.y)
+    {
+        return;
+    }
+
+    int2 bounds = int2(_PrometheusDenoiseSize.xy) - 1;
+    int stepSize = max(1, (int)_PrometheusDenoiseParams.x);
+
+    float4 centre = _PrometheusFilterInput.Load(int3(pixel, 0));
+    float4 centreGeometry = _PrometheusHistoryGeometryOut[pixel];
+
+    float centreDepth = centreGeometry.w;
+    float3 centreNormal = centreGeometry.xyz;
+    float centreValue = centre.x;
+
+    // The variance carried in the signal sets the luminance tolerance, which is what
+    // makes this variance-guided rather than a fixed bilateral blur.
+    float luminanceStdDev = sqrt(max(centre.w, 1e-8));
+
+    // Local depth slope, so a steeply sloped surface is not mistaken for a discontinuity.
+    float depthGradient = max(
+        abs(centreDepth - _PrometheusHistoryGeometryOut[clamp(int2(pixel) + int2(stepSize, 0), int2(0, 0), bounds)].w),
+        abs(centreDepth - _PrometheusHistoryGeometryOut[clamp(int2(pixel) + int2(0, stepSize), int2(0, 0), bounds)].w));
+    depthGradient = max(depthGradient, 1e-3);
+
+    float centreWeight = PrometheusAtrousKernelWeight(0, 0);
+
+    float4 sum = centre * centreWeight;
+    float weightSum = centreWeight;
+
+    // Variance is a second moment, so it does not average like the signal does. It is
+    // accumulated separately against the squared weights; see the normalisation below.
+    float varianceSum = centre.w * centreWeight * centreWeight;
+
+    [unroll]
+    for (int oy = -2; oy <= 2; oy++)
+    {
+        [unroll]
+        for (int ox = -2; ox <= 2; ox++)
+        {
+            if (ox == 0 && oy == 0)
+            {
+                continue;
+            }
+
+            int2 tap = clamp(int2(pixel) + (int2(ox, oy) * stepSize), int2(0, 0), bounds);
+
+            float4 tapColor = _PrometheusFilterInput.Load(int3(tap, 0));
+            float4 tapGeometry = _PrometheusHistoryGeometryOut[tap];
+
+            // Chebyshev distance, matching how the a-trous taps are laid out: the ring at
+            // (2,0) and the one at (2,2) are both two steps out along the axis that decides
+            // whether the depth difference is slope or discontinuity.
+            float tapDistance = (float)max(abs(ox), abs(oy));
+
+            float weight = PrometheusAtrousKernelWeight(ox, oy) * PrometheusAtrousWeight(
+                centreDepth, tapGeometry.w, depthGradient, tapDistance,
+                centreNormal, tapGeometry.xyz,
+                centreValue, tapColor.x,
+                luminanceStdDev);
+
+            sum += tapColor * weight;
+            weightSum += weight;
+            varianceSum += tapColor.w * weight * weight;
+        }
+    }
+
+    float normalisation = max(weightSum, 1e-5);
+    float4 filtered = sum / normalisation;
+
+    // Variance is a squared quantity, so it contracts with the square of the weights
+    // rather than linearly: Var(sum w_i x_i / sum w_i) = sum w_i^2 Var(x_i) / (sum w_i)^2.
+    // Dividing it by the plain weight sum along with the other channels leaves it roughly
+    // at its input magnitude, so it never falls as the estimate converges.
+    //
+    // That is what turns a crisp shadow boundary to mud. The luma term's tolerance is
+    // SIGMA_LUMA standard deviations of this value, so a variance that does not decay keeps
+    // the tolerance wide, and each iteration doubles its step while still permitting taps
+    // from the far side of the boundary. The blur therefore grows with the support instead
+    // of tightening against it, and the widest iteration is the one that does the damage.
+    filtered.w = max(0.0, varianceSum / (normalisation * normalisation));
+
+    _PrometheusFilterOutput[pixel] = filtered;
+}
+
+// =====================================================================================
+//  Kernel 3: joint-bilateral upsample
+// =====================================================================================
+
+/// Expands the filtered sub-sampled visibility to native resolution, guided by the
+/// full-resolution G-buffer. See SpatialUpsamplePass.hlsl for why bilinear will not do.
+[numthreads(PROMETHEUS_THREAD_GROUP_SIZE, PROMETHEUS_THREAD_GROUP_SIZE, 1)]
+void CS_SpatialUpsample(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint2 pixel = dispatchThreadId.xy;
+
+    if (pixel.x >= (uint)_PrometheusFullResSize.x || pixel.y >= (uint)_PrometheusFullResSize.y)
+    {
+        return;
+    }
+
+    float rawDepth = _PrometheusSceneDepth.Load(int3(pixel, 0)).r;
+    float linearDepth = PrometheusLinearEyeDepth(rawDepth, _PrometheusZBufferParams);
+    float3 normal = PrometheusDecodeSceneNormal(_PrometheusSceneNormals.Load(int3(pixel, 0)));
+
+    float2 uv = (pixel + 0.5) * _PrometheusFullResSize.zw;
+    float2 coarseCoord = (uv * _PrometheusDenoiseSize.xy) - 0.5;
+    int2 coarseBase = int2(floor(coarseCoord));
+    float2 coarseFraction = coarseCoord - coarseBase;
+    int2 bounds = int2(_PrometheusDenoiseSize.xy) - 1;
+    int2 nearest = clamp(int2(round(coarseCoord)), int2(0, 0), bounds);
+
+    PrometheusUpsampleAccumulator accumulator = PrometheusBeginUpsample();
+
+    [unroll]
+    for (int oy = 0; oy <= PROMETHEUS_UPSAMPLE_RADIUS; oy++)
+    {
+        [unroll]
+        for (int ox = 0; ox <= PROMETHEUS_UPSAMPLE_RADIUS; ox++)
+        {
+            int2 tap = clamp(coarseBase + int2(ox, oy), int2(0, 0), bounds);
+
+            float4 tapColor = _PrometheusFilterInput.Load(int3(tap, 0));
+            float4 tapGeometry = _PrometheusHistoryGeometryOut[tap];
+
+            float spatialWeight = PrometheusUpsampleSpatialWeight(float2(ox, oy) - coarseFraction);
+            float geometryWeight = PrometheusUpsampleGeometryWeight(
+                linearDepth, tapGeometry.w, normal, tapGeometry.xyz);
+
+            PrometheusAccumulateUpsampleTap(
+                accumulator,
+                tapColor.x,
+                spatialWeight * geometryWeight,
+                all(tap == nearest));
+        }
+    }
+
+    _PrometheusDenoisedVisibility[pixel] = saturate(PrometheusResolveUpsample(accumulator));
+}
